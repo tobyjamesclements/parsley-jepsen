@@ -6,9 +6,10 @@ message B, every process that delivers both delivers A first, across restarts an
 lifetime of a process. Where the guarantee cannot be upheld, a process stops rather than weaken
 it.
 
-This repository is at the design stage. The plan below is the contract for what gets built, and
-the code follows it. Criteria are cited as in Parsley's `SPEC.md`: "Safety 1", "Structural 15",
-"Host obligation 6".
+The plan below is the contract for what gets built, and the code follows it. Criteria are cited
+as in Parsley's `SPEC.md`: "Safety 1", "Structural 15", "Host obligation 6". The first three
+items of the build order are in place and verified; the rest is drafted and unverified, as
+[Build order](#build-order) says.
 
 ## Why a Jepsen test
 
@@ -75,6 +76,31 @@ expressed frontier at that step. Keyed by task, each task's trace lands on one p
 step order. The app serves `Parsley.status()` over a local port and logs to a file the test
 collects.
 
+As built (`JepsenTopology`, `JepsenHarness` in Parsley's test tree, branch
+`claude/new-session-7c5301`): topics `src`, `a`, `b`, `c`, `d`, `loop`, `self` and `trace`, all
+of one width; `splitter` (src → a, b), `joiner` (a, b, loop → c), `cycler` (c → d, and loop
+half the time), `selfer` (d, self → self two times in three), each forward bounded at six hops.
+Every value is its own uid and each forward appends `>process>topic`, so a record is matched
+to the delivery that produced it by its uid alone. The trace value is EDN naming the delivery
+and the effects the step sent, so a checker never needs the forwarding rule. The jar is built
+by `./mvnw -Pjepsen-harness -DskipTests package` in Parsley and has these commands:
+
+```
+java -jar parsley-jepsen-harness.jar run --bootstrap n1:9092 --prefix jepsen \
+    --state-dir /var/lib/parsley --status-port 8080 --log-file /var/log/parsley.log \
+    [--drop-topic loop]
+java -jar parsley-jepsen-harness.jar create-topics --bootstrap n1:9092 --partitions 3 \
+    --replication 3 --min-isr 2
+java -jar parsley-jepsen-harness.jar export --bootstrap n1:9092 --out run.edn
+java -jar parsley-jepsen-harness.jar check --in run.edn
+java -jar parsley-jepsen-harness.jar export-simulator --out test/resources/exports --seeds 120
+java -jar parsley-jepsen-harness.jar codec-vectors --out test/resources/codec-vectors.edn
+```
+
+`run` keeps serving status after a process stops, since a refusal is terminal by design and
+the status clients must read it. `export` writes the export the checker judges; `check` replays
+it through Parsley's own `Oracle`.
+
 ## Workload
 
 - **Producer clients** send to source topics: unstamped records, which Safety 6 makes
@@ -123,6 +149,20 @@ nothing ever delivers.
   records a client had observed before a stamped send, and transitively by their causes. This
   is a sound subset of the true causes. Causes known only through receipt of held messages are
   caught by the expression check instead.
+- **Receipt** is known from the read observations, never guessed. A status client reads the
+  trace's last stable offsets, then every group's committed positions, then the trace's high
+  watermarks. A trace record below the first bracket had committed before the positions were
+  read, so its step's receipts lie within them; a trace record at or past the second had not
+  been acknowledged, so its step had not committed and everything the positions cover was
+  received before it. That gives a lower bound on receipt, which extends the causal past with
+  the causes of received messages, and an upper bound, which bounds what a send may express.
+  Both brackets hold with several tasks sharing a trace partition and with a fenced zombie's
+  open transaction, which a last-stable-offset bracket on the far side would not.
+- **The export** is one EDN map: the declaration, topic identities with log starts and
+  liveness, every task's received channels, every committed record with its raw
+  `parsley.causes` header, the trace, the read observations, the status history, the faults
+  with the refusals each justifies, and start positions. The simulator and a cluster produce
+  the same shape (`JepsenExport` in Parsley).
 - **Decoding** uses a second implementation of the frozen grammar in Parsley's
   `docs/wire-format.md`, written in Clojure from that page alone, which doubles as a check
   that the page stands alone. Its test vectors come from Parsley's `CausesCodecTest`.
@@ -130,6 +170,15 @@ nothing ever delivers.
   under each of Parsley's `Sabotage` modes are exported into the trace format, and the checker
   must flag every mode. A live inversion, manufactured by an external producer that stamps
   less than it knows, must be caught on the cluster.
+
+  Done for the export-based replay in Parsley (`JepsenExportOracleCalibrationTest`) and for
+  `checker.clj` (`checker_test.clj`) over `test/resources/exports`: six honest seeds and the
+  honest dead-holds scenario pass, three seeds per sabotage mode and the host fault are
+  flagged, the constructed `DELIVER_PAST_DEAD_HOLDS` inversion is flagged as Safety 1, and a
+  real two-instance run against the embedded broker (`cluster-honest.edn`) passes. Over 120
+  seeds per mode, the export replay catches most of what the simulator's own oracle catches;
+  `index.edn` records the figures. The gap is receipt the observations do not cover, which the
+  simulator's oracle sees exactly. The live inversion on a cluster is not yet done.
 
 ## Out of scope
 
@@ -144,7 +193,7 @@ nothing ever delivers.
 ```
 project.clj
 src/parsley_jepsen/
-  core.clj       command line and test map
+  core.clj       command line and test map, and the history-to-export adapter
   db.clj         Apache Kafka KRaft: install, configure, start, stop, kill, pause, logs
   client.clj     producer, consumer and admin clients behind the operations
   workload.clj   generator: producer and status operations, the final phase
@@ -153,19 +202,33 @@ src/parsley_jepsen/
   checker.clj    the oracle over the trace and the topic dumps
 test/parsley_jepsen/
   wire_test.clj      the codec vectors
-  checker_test.clj   simulator exports under each sabotage mode
+  checker_test.clj   simulator exports under each sabotage mode, and a cluster run
+test/resources/
+  codec-vectors.edn  exported from Parsley's CausesCodecTest and CausesMalformationVectors
+  exports/           the calibration set, with index.edn naming each file's expected outcome
 ```
 
 The harness app is built from Parsley's test tree as a jar the DB adapter installs on each
-node alongside the broker.
+node alongside the broker. On Parsley's side the pieces are `JepsenTopology`,
+`JepsenHarness`, `JepsenExport` and `JepsenEdn`, `JepsenClusterExport`,
+`JepsenExportOracle` (the replay through `Oracle`), `JepsenSimulatorExport` (an observer on
+`Scenario` and `SimProcess`), `JepsenCodecVectors`, and the tests
+`JepsenHarnessIntegrationTest` and `JepsenExportOracleCalibrationTest`.
 
 ## Build order
 
-- [ ] The harness app and the trace, run locally against Parsley's embedded broker, with the
-      Java `Oracle` as the first checker over the trace.
-- [ ] The Clojure decoder, against the codec vectors.
-- [ ] The checker, and its calibration against simulator exports.
-- [ ] The KRaft DB adapter, developed on Jepsen's docker nodes.
+- [x] The harness app and the trace, run locally against Parsley's embedded broker, with the
+      Java `Oracle` as the first checker over the trace. Two instances, external unstamped and
+      stamped records, an out-of-contract stamp, an instance killed with its state wiped and
+      restarted: the export replays clean, and negative controls (an inverted pair, an erased
+      delivery, a twice-committed effect) do not. A malformed header stops the receiving
+      process and the replay accepts the justified refusal.
+- [x] The Clojure decoder, against the codec vectors.
+- [x] The checker, and its calibration against simulator exports.
+- [ ] The KRaft DB adapter, developed on Jepsen's docker nodes. `db.clj`, `client.clj`,
+      `workload.clj`, `nemesis.clj` and `core.clj` are drafted to the design but have never
+      been compiled or run: they were written where Clojars, and so Jepsen, was unreachable.
+      Expect them to need work on first contact with real nodes.
 - [ ] Nemeses in order of expected yield: instance pause and kill, partitions during commit,
       retention and record deletion, topic delete and recreate, offset reset, changelog
       deletion, clock skew.
@@ -183,7 +246,17 @@ node alongside the broker.
 
 ## Running
 
-Nothing runs yet. The planned entry point follows Jepsen convention:
+The decoder and checker tests run with `lein test`. Without Leiningen, plain Clojure from
+Maven Central runs them from the project root:
+
+```
+java -cp "lib/*:src:test" clojure.main -e \
+  "(require 'clojure.test 'parsley-jepsen.wire-test 'parsley-jepsen.checker-test)
+   (clojure.test/run-tests 'parsley-jepsen.wire-test 'parsley-jepsen.checker-test)"
+```
+
+The cluster test itself does not run yet. The planned entry point follows Jepsen convention,
+with the harness jar built from Parsley beside it:
 
 ```
 lein run test --nodes-file nodes.txt --kafka-version 4.3.1 --time-limit 3600 \

@@ -1,0 +1,37 @@
+{:format 1
+ :source :simulator
+ :seed 0
+ :sabotage :DELIVER_PAST_DEAD_HOLDS
+ :host-fault nil
+ :trace-topic nil
+ :processes {"q" {:receives ["chanA" "ct"], :sends ["chanB"]}, "p" {:receives ["chanA" "c9" "chanB"], :sends []}}
+ :topics [{:id "c13f9fe8-25a2-4f98-22c3-4374c76936b8", :name "chanA", :partitions 1, :alive false, :log-start {0 0}}
+  {:id "a673e439-a1bb-a2cb-2eda-c4c4024d7bf6", :name "chanB", :partitions 1, :alive true, :log-start {0 0}}
+  {:id "4792faaf-193f-da09-0441-13651bee9409", :name "c9", :partitions 1, :alive true, :log-start {0 0}}
+  {:id "edc1710f-7697-7578-78d9-a0ae721ff9c7", :name "ct", :partitions 1, :alive true, :log-start {0 0}}]
+ :tasks [{:process "q", :task 0, :receives [["c13f9fe8-25a2-4f98-22c3-4374c76936b8" 0] ["edc1710f-7697-7578-78d9-a0ae721ff9c7" 0]]}
+  {:process "p", :task 0, :receives [["4792faaf-193f-da09-0441-13651bee9409" 0] ["a673e439-a1bb-a2cb-2eda-c4c4024d7bf6" 0] ["c13f9fe8-25a2-4f98-22c3-4374c76936b8" 0]]}]
+ :start-positions [{:process "q", :task 0, :positions {["c13f9fe8-25a2-4f98-22c3-4374c76936b8" 0] 0, ["edc1710f-7697-7578-78d9-a0ae721ff9c7" 0] 0}}
+  {:process "p", :task 0, :positions {["4792faaf-193f-da09-0441-13651bee9409" 0] 0, ["a673e439-a1bb-a2cb-2eda-c4c4024d7bf6" 0] 0, ["c13f9fe8-25a2-4f98-22c3-4374c76936b8" 0] 0}}]
+ :records [{:topic "c13f9fe8-25a2-4f98-22c3-4374c76936b8", :partition 0, :offset 0, :key "X1", :value "X1", :uid "X1", :causes "01014792faaf193fda09044113651bee940901000000000000000001", :stamped-from ["4792faaf-193f-da09-0441-13651bee9409" 0 1]}
+  {:topic "a673e439-a1bb-a2cb-2eda-c4c4024d7bf6", :partition 0, :offset 0, :key "T>q>chanB", :value "T>q>chanB", :uid "T>q>chanB", :causes "01024792faaf193fda09044113651bee940901000000000000000001edc1710f7697757878d9a0ae721ff9c701000000000000000000"}
+  {:topic "4792faaf-193f-da09-0441-13651bee9409", :partition 0, :offset 0, :key "N0", :value "N0", :uid "N0", :causes nil}
+  {:topic "4792faaf-193f-da09-0441-13651bee9409", :partition 0, :offset 1, :key "N1", :value "N1", :uid "N1", :causes nil}
+  {:topic "edc1710f-7697-7578-78d9-a0ae721ff9c7", :partition 0, :offset 0, :key "T", :value "T", :uid "T", :causes nil}]
+ :trace [{:process "q", :task 0, :tp "q", :to 0, :channel ["c13f9fe8-25a2-4f98-22c3-4374c76936b8" 0], :offset 0, :uid "X1", :causes "01024792faaf193fda09044113651bee940901000000000000000001c13f9fe825a24f9822c34374c76936b801000000000000000000", :effects []}
+  {:process "q", :task 0, :tp "q", :to 1, :channel ["edc1710f-7697-7578-78d9-a0ae721ff9c7" 0], :offset 0, :uid "T", :causes "01024792faaf193fda09044113651bee940901000000000000000001edc1710f7697757878d9a0ae721ff9c701000000000000000000", :effects [["chanB" "T>q>chanB"]]}
+  {:process "p", :task 0, :tp "p", :to 0, :channel ["4792faaf-193f-da09-0441-13651bee9409" 0], :offset 0, :uid "N0", :causes "01024792faaf193fda09044113651bee940901000000000000000001edc1710f7697757878d9a0ae721ff9c701000000000000000000", :effects []}
+  {:process "p", :task 0, :tp "p", :to 1, :channel ["4792faaf-193f-da09-0441-13651bee9409" 0], :offset 1, :uid "N1", :causes "01024792faaf193fda09044113651bee940901000000000000000001edc1710f7697757878d9a0ae721ff9c701000000000000000000", :effects []}
+  {:process "p", :task 0, :tp "p", :to 2, :channel ["a673e439-a1bb-a2cb-2eda-c4c4024d7bf6" 0], :offset 0, :uid "T>q>chanB", :causes "01034792faaf193fda09044113651bee940901000000000000000001a673e439a1bba2cb2edac4c4024d7bf601000000000000000000edc1710f7697757878d9a0ae721ff9c701000000000000000000", :effects []}
+  {:process "p", :task 0, :tp "p", :to 3, :channel ["c13f9fe8-25a2-4f98-22c3-4374c76936b8" 0], :offset 0, :uid "X1", :causes "01044792faaf193fda09044113651bee940901000000000000000001a673e439a1bba2cb2edac4c4024d7bf601000000000000000000c13f9fe825a24f9822c34374c76936b801000000000000000000edc1710f7697757878d9a0ae721ff9c701000000000000000000", :effects []}]
+ :reads [{:index 4, :time nil, :process "q", :task 0, :ends-lo {"p" 0, "q" 1}, :ends-hi {"p" 0, "q" 1}, :next-read {["c13f9fe8-25a2-4f98-22c3-4374c76936b8" 0] 1, ["edc1710f-7697-7578-78d9-a0ae721ff9c7" 0] 0}, :exec-start {["c13f9fe8-25a2-4f98-22c3-4374c76936b8" 0] 0, ["edc1710f-7697-7578-78d9-a0ae721ff9c7" 0] 0}}
+  {:index 5, :time nil, :process "p", :task 0, :ends-lo {"p" 0, "q" 1}, :ends-hi {"p" 0, "q" 1}, :next-read {["4792faaf-193f-da09-0441-13651bee9409" 0] 0, ["a673e439-a1bb-a2cb-2eda-c4c4024d7bf6" 0] 0, ["c13f9fe8-25a2-4f98-22c3-4374c76936b8" 0] 1}, :exec-start {["4792faaf-193f-da09-0441-13651bee9409" 0] 0, ["a673e439-a1bb-a2cb-2eda-c4c4024d7bf6" 0] 0, ["c13f9fe8-25a2-4f98-22c3-4374c76936b8" 0] 0}}
+  {:index 8, :time nil, :process "q", :task 0, :ends-lo {"p" 0, "q" 2}, :ends-hi {"p" 0, "q" 2}, :next-read {["c13f9fe8-25a2-4f98-22c3-4374c76936b8" 0] 1, ["edc1710f-7697-7578-78d9-a0ae721ff9c7" 0] 1}, :exec-start {["c13f9fe8-25a2-4f98-22c3-4374c76936b8" 0] 1, ["edc1710f-7697-7578-78d9-a0ae721ff9c7" 0] 0}}
+  {:index 10, :time nil, :process "p", :task 0, :ends-lo {"p" 4, "q" 2}, :ends-hi {"p" 4, "q" 2}, :next-read {["4792faaf-193f-da09-0441-13651bee9409" 0] 2, ["a673e439-a1bb-a2cb-2eda-c4c4024d7bf6" 0] 1, ["c13f9fe8-25a2-4f98-22c3-4374c76936b8" 0] 1}, :exec-start {["4792faaf-193f-da09-0441-13651bee9409" 0] 0, ["a673e439-a1bb-a2cb-2eda-c4c4024d7bf6" 0] 0, ["c13f9fe8-25a2-4f98-22c3-4374c76936b8" 0] 1}}]
+ :statuses [{:index 1, :time nil, :process "q", :lifecycle :RUNNING, :refusal nil, :detail nil, :trace-ends {"q" 0}}
+  {:index 3, :time nil, :process "p", :lifecycle :RUNNING, :refusal nil, :detail nil, :trace-ends {"p" 0, "q" 0}}
+  {:index 7, :time nil, :process "q", :lifecycle :RUNNING, :refusal nil, :detail nil, :trace-ends {"p" 0, "q" 1}}
+  {:index 9, :time nil, :process "p", :lifecycle :RUNNING, :refusal nil, :detail nil, :trace-ends {"p" 0, "q" 2}}]
+ :faults [{:index 0, :time nil, :kind :declared, :justifies [], :trace-ends {"q" 0}, :details {:process "q", :receives [["c13f9fe8-25a2-4f98-22c3-4374c76936b8" 0] ["edc1710f-7697-7578-78d9-a0ae721ff9c7" 0]]}}
+  {:index 2, :time nil, :kind :declared, :justifies [], :trace-ends {"p" 0, "q" 0}, :details {:process "p", :receives [["4792faaf-193f-da09-0441-13651bee9409" 0] ["a673e439-a1bb-a2cb-2eda-c4c4024d7bf6" 0] ["c13f9fe8-25a2-4f98-22c3-4374c76936b8" 0]]}}
+  {:index 6, :time nil, :kind :kill, :justifies [:CHANNEL_DELETED_WITH_UNDELIVERED_MESSAGES], :trace-ends {"p" 0, "q" 1}, :details {:channel ["c13f9fe8-25a2-4f98-22c3-4374c76936b8" 0], :topic "chanA"}}]}
