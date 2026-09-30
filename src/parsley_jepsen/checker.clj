@@ -141,7 +141,13 @@
         first-refusal (reduce (fn [m s] (if (and (:refusal s) (not (contains? m (:process s))))
                                           (assoc m (:process s) s) m))
                               {} (sort-by :index (:statuses export)))
-        last-assigned (reduce (fn [m r] (update m (:channel r) (fnil max -1) (:offset r))) {} records)
+        ;; The last assigned position counts the offsets transaction markers and aborted records
+        ;; took, which the export's log ends record and no committed record occupies: a frontier
+        ;; names such a position once an out-of-contract stamp was settled by the channel moving
+        ;; past it. Records alone stand in where an export predates the log ends.
+        last-assigned (reduce (fn [m r] (update m (:channel r) (fnil max -1) (:offset r)))
+                              (into {} (for [t (:topics export) [p end] (:log-end t) :when (pos? end)] [[(:id t) p] (dec end)]))
+                              records)
         undecodable (into #{} (map :pos (filter #(= :undecodable (:meta %)) records)))]
     {:export export
      :topics topics
@@ -370,21 +376,28 @@
 (defn- expression-bound
   "Everything the task could have seen expressed by the time of `entry`: what it had
   delivered, every position it could have received on a channel it ever received, and every
-  position the records there name."
+  position the records there name. Nil when retention has discarded records the task may
+  have received and the export does not hold them, since what they named is gone with
+  them; the simulator's export keeps every record its retention discarded."
   [m task entry delivered-positions]
   (reduce (fn [bound channel]
-            (let [records (get-in m [:records-by-channel channel])]
-              (reduce (fn [bound [from to]]
-                        (reduce (fn [bound [_ r]]
-                                  (let [bound (update bound channel (fnil max -1) (:offset r))]
-                                    (if (map? (:meta r))
-                                      (reduce (fn [bound [named position]] (update bound named (fnil max -1) position))
-                                              bound (:meta r))
-                                      bound)))
-                                bound
-                                (when records (subseq records >= from < to))))
-                      bound
-                      (merged-spans (received-spans-up-to m task channel entry)))))
+            (let [records (get-in m [:records-by-channel channel])
+                  spans (merged-spans (received-spans-up-to m task channel entry))
+                  log-start (log-start m channel)]
+              (if (and (pos? log-start) (seq spans) (< (ffirst spans) log-start)
+                       (empty? (when records (subseq records < log-start))))
+                (reduced nil)
+                (reduce (fn [bound [from to]]
+                          (reduce (fn [bound [_ r]]
+                                    (let [bound (update bound channel (fnil max -1) (:offset r))]
+                                      (if (map? (:meta r))
+                                        (reduce (fn [bound [named position]] (update bound named (fnil max -1) position))
+                                                bound (:meta r))
+                                        bound)))
+                                  bound
+                                  (when records (subseq records >= from < to))))
+                        bound
+                        spans))))
           (reduce (fn [bound [id partition offset]] (update bound [id partition] (fnil max -1) offset)) {} delivered-positions)
           (received-ever m task)))
 
@@ -425,7 +438,9 @@
                  causes))))
 
 (defn- check-expression
-  "The expression checks on one send: Structural 14 and 12, over-expression, Structural 15."
+  "The expression checks on one send: Structural 14 and 12, over-expression, Structural 15.
+  With `upper` nil, what the sender could have seen expressed is unknown, and the two checks
+  that need it are not made."
   [m sent-pos meta past upper excused]
   (if (= :undecodable meta)
     [(str "Trace: the frontier expressed by " (pos-str sent-pos) " is undecodable")]
@@ -435,16 +450,21 @@
        (for [[channel position] meta
              :when (and (= channel own-channel) (>= position own-offset))]
          (str "Structural 14: " (pos-str sent-pos) " expresses dependency on own channel at or above itself: " position))
-       (for [[channel position] meta
-             :let [last (get-in m [:last-assigned channel])]
-             :when (and last (> position last))]
-         (str "Structural 12: " (pos-str sent-pos) " expresses position " (channel-str channel) "@" position
-              " which was unassigned at send time (last assigned: " last ")"))
-       (for [[channel position] meta
-             :let [bound (get upper channel)]
-             :when (or (nil? bound) (> position bound))]
-         (str "Over-expression: " (pos-str sent-pos) " expresses " (channel-str channel) "@" position
-              " above anything its sender had delivered or seen expressed at send time (bound: " bound ")"))
+       ;; Structural 12 lets a process express a position it learned from the metadata of a
+       ;; message it received, assigned or not: an out-of-contract stamp naming the log end
+       ;; is held, and its position travels in the holder's frontier meanwhile.
+       (when upper
+         (for [[channel position] meta
+               :let [last (get-in m [:last-assigned channel])]
+               :when (and last (> position last) (> position (get upper channel -1)))]
+           (str "Structural 12: " (pos-str sent-pos) " expresses position " (channel-str channel) "@" position
+                " which was unassigned at send time (last assigned: " last ")")))
+       (when upper
+         (for [[channel position] meta
+               :let [bound (get upper channel)]
+               :when (or (nil? bound) (> position bound))]
+           (str "Over-expression: " (pos-str sent-pos) " expresses " (channel-str channel) "@" position
+                " above anything its sender had delivered or seen expressed at send time (bound: " bound ")")))
        (for [[id partition offset :as cause] past
              :when (not (contains? excused cause))
              :let [expressed (get meta [id partition])]

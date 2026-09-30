@@ -5,14 +5,14 @@
  :host-fault :RESET_PAST_LOG_START
  :trace-topic nil
  :processes {"p0" {:receives ["c1" "c3" "c2"], :sends ["c2"]}, "p1" {:receives ["c2" "c3"], :sends ["c1" "c3"]}}
- :topics [{:id "c12e0320-f440-3278-24f9-0c552ea6d133", :name "c0", :partitions 1, :alive false, :log-start {0 0}}
-  {:id "5c70ed4b-d035-fcee-07a5-484da2739e85", :name "c1", :partitions 1, :alive true, :log-start {0 19}}
-  {:id "63e55975-e2e0-fcf9-090a-5c3acf19eb5f", :name "c2", :partitions 2, :alive true, :log-start {0 0, 1 13}}
-  {:id "aa0e3dd5-1a56-0c0a-564e-f53e28d8d86b", :name "c3", :partitions 1, :alive true, :log-start {0 0}}
-  {:id "ca796da0-78df-bc7a-3a48-3e6f76e965ad", :name "c0", :partitions 1, :alive false, :log-start {0 0}}
-  {:id "bf8a0489-4e76-b8be-1733-22005d1586d7", :name "c0", :partitions 1, :alive false, :log-start {0 0}}
-  {:id "c97f868a-3e04-61d9-295d-f8a219bba8da", :name "c0", :partitions 1, :alive false, :log-start {0 0}}
-  {:id "fc68b7e4-778c-6111-0db3-4b28340c7cc0", :name "c0", :partitions 1, :alive false, :log-start {0 1}}]
+ :topics [{:id "c12e0320-f440-3278-24f9-0c552ea6d133", :name "c0", :partitions 1, :alive false, :log-start {0 0}, :log-end {0 2}}
+  {:id "5c70ed4b-d035-fcee-07a5-484da2739e85", :name "c1", :partitions 1, :alive true, :log-start {0 19}, :log-end {0 21}}
+  {:id "63e55975-e2e0-fcf9-090a-5c3acf19eb5f", :name "c2", :partitions 2, :alive true, :log-start {0 0, 1 13}, :log-end {0 8, 1 15}}
+  {:id "aa0e3dd5-1a56-0c0a-564e-f53e28d8d86b", :name "c3", :partitions 1, :alive true, :log-start {0 0}, :log-end {0 18}}
+  {:id "ca796da0-78df-bc7a-3a48-3e6f76e965ad", :name "c0", :partitions 1, :alive false, :log-start {0 0}, :log-end {0 0}}
+  {:id "bf8a0489-4e76-b8be-1733-22005d1586d7", :name "c0", :partitions 1, :alive false, :log-start {0 0}, :log-end {0 2}}
+  {:id "c97f868a-3e04-61d9-295d-f8a219bba8da", :name "c0", :partitions 1, :alive false, :log-start {0 0}, :log-end {0 0}}
+  {:id "fc68b7e4-778c-6111-0db3-4b28340c7cc0", :name "c0", :partitions 1, :alive false, :log-start {0 1}, :log-end {0 7}}]
  :tasks [{:process "p0", :task 0, :receives [["5c70ed4b-d035-fcee-07a5-484da2739e85" 0] ["63e55975-e2e0-fcf9-090a-5c3acf19eb5f" 0]]}
   {:process "p1", :task 0, :receives [["5c70ed4b-d035-fcee-07a5-484da2739e85" 0]]}]
  :start-positions [{:process "p0", :task 0, :positions {["5c70ed4b-d035-fcee-07a5-484da2739e85" 0] 0, ["63e55975-e2e0-fcf9-090a-5c3acf19eb5f" 0] 0}}

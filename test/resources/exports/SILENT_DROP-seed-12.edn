@@ -5,10 +5,10 @@
  :host-fault nil
  :trace-topic nil
  :processes {"p0" {:receives ["c2" "c0"], :sends ["c2" "c0"]}, "p1" {:receives ["c0" "c2"], :sends ["c0"]}, "p2" {:receives ["c2" "c0"], :sends ["c0"]}}
- :topics [{:id "c1803416-300a-0fb8-4553-62ebf78755a0", :name "c0", :partitions 2, :alive true, :log-start {0 5, 1 22}}
-  {:id "607ec2f4-a1fb-02f5-13f4-37cd0c6c5294", :name "c1", :partitions 1, :alive false, :log-start {0 0}}
-  {:id "350f9f2a-e09b-af47-1d5f-085635a4fe7a", :name "c2", :partitions 2, :alive true, :log-start {0 10, 1 21}}
-  {:id "90a7d78f-7387-4d60-7780-bff4297a1ec3", :name "c1", :partitions 1, :alive false, :log-start {0 0}}]
+ :topics [{:id "c1803416-300a-0fb8-4553-62ebf78755a0", :name "c0", :partitions 2, :alive true, :log-start {0 5, 1 22}, :log-end {0 38, 1 23}}
+  {:id "607ec2f4-a1fb-02f5-13f4-37cd0c6c5294", :name "c1", :partitions 1, :alive false, :log-start {0 0}, :log-end {0 3}}
+  {:id "350f9f2a-e09b-af47-1d5f-085635a4fe7a", :name "c2", :partitions 2, :alive true, :log-start {0 10, 1 21}, :log-end {0 10, 1 23}}
+  {:id "90a7d78f-7387-4d60-7780-bff4297a1ec3", :name "c1", :partitions 1, :alive false, :log-start {0 0}, :log-end {0 11}}]
  :tasks [{:process "p0", :task 0, :receives [["350f9f2a-e09b-af47-1d5f-085635a4fe7a" 1] ["c1803416-300a-0fb8-4553-62ebf78755a0" 1]]}
   {:process "p1", :task 0, :receives [["350f9f2a-e09b-af47-1d5f-085635a4fe7a" 0]]}
   {:process "p2", :task 0, :receives [["350f9f2a-e09b-af47-1d5f-085635a4fe7a" 0] ["350f9f2a-e09b-af47-1d5f-085635a4fe7a" 1]]}]

@@ -5,13 +5,13 @@
  :host-fault nil
  :trace-topic nil
  :processes {"p0" {:receives ["c2" "c4" "c1"], :sends ["c4" "c1"]}, "p1" {:receives ["c4"], :sends []}, "p2" {:receives ["c4" "c2" "c1"], :sends ["c4" "c2"]}}
- :topics [{:id "c1513caf-5704-6cb8-208d-7a96602b9c3d", :name "c0", :partitions 1, :alive false, :log-start {0 0}}
-  {:id "f076db27-7341-48a8-5610-413b62275967", :name "c1", :partitions 1, :alive true, :log-start {0 1}}
-  {:id "2b409be8-4f9e-b71a-7f77-ca8f68c33cb4", :name "c2", :partitions 1, :alive true, :log-start {0 1}}
-  {:id "3174a448-d2d8-dee6-1b64-4c1dbb671b23", :name "c3", :partitions 1, :alive false, :log-start {0 0}}
-  {:id "6201ddac-251b-94bf-40ae-ca26990bbdf3", :name "c4", :partitions 2, :alive true, :log-start {0 0, 1 8}}
-  {:id "03cf03de-b349-53cc-4765-e6a29d8c9f54", :name "c0", :partitions 1, :alive false, :log-start {0 0}}
-  {:id "e701b5c3-4260-ab76-431a-1c84ec0c3e62", :name "c0", :partitions 1, :alive false, :log-start {0 0}}]
+ :topics [{:id "c1513caf-5704-6cb8-208d-7a96602b9c3d", :name "c0", :partitions 1, :alive false, :log-start {0 0}, :log-end {0 2}}
+  {:id "f076db27-7341-48a8-5610-413b62275967", :name "c1", :partitions 1, :alive true, :log-start {0 1}, :log-end {0 3}}
+  {:id "2b409be8-4f9e-b71a-7f77-ca8f68c33cb4", :name "c2", :partitions 1, :alive true, :log-start {0 1}, :log-end {0 12}}
+  {:id "3174a448-d2d8-dee6-1b64-4c1dbb671b23", :name "c3", :partitions 1, :alive false, :log-start {0 0}, :log-end {0 7}}
+  {:id "6201ddac-251b-94bf-40ae-ca26990bbdf3", :name "c4", :partitions 2, :alive true, :log-start {0 0, 1 8}, :log-end {0 3, 1 11}}
+  {:id "03cf03de-b349-53cc-4765-e6a29d8c9f54", :name "c0", :partitions 1, :alive false, :log-start {0 0}, :log-end {0 0}}
+  {:id "e701b5c3-4260-ab76-431a-1c84ec0c3e62", :name "c0", :partitions 1, :alive false, :log-start {0 0}, :log-end {0 7}}]
  :tasks [{:process "p0", :task 0, :receives [["3174a448-d2d8-dee6-1b64-4c1dbb671b23" 0] ["f076db27-7341-48a8-5610-413b62275967" 0]]}
   {:process "p1", :task 0, :receives [["3174a448-d2d8-dee6-1b64-4c1dbb671b23" 0]]}
   {:process "p2", :task 0, :receives [["2b409be8-4f9e-b71a-7f77-ca8f68c33cb4" 0]]}]

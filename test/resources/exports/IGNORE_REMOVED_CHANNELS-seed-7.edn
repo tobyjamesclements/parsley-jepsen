@@ -5,11 +5,11 @@
  :host-fault nil
  :trace-topic nil
  :processes {"p0" {:receives ["c1" "c0"], :sends []}, "p1" {:receives ["c0" "c1"], :sends ["c0" "c1"]}, "p2" {:receives ["c2" "c0"], :sends []}}
- :topics [{:id "c13f9fe8-25a2-4f98-22c3-4374c76936b8", :name "c0", :partitions 1, :alive true, :log-start {0 6}}
-  {:id "a673e439-a1bb-a2cb-2eda-c4c4024d7bf6", :name "c1", :partitions 1, :alive true, :log-start {0 9}}
-  {:id "4792faaf-193f-da09-0441-13651bee9409", :name "c2", :partitions 2, :alive false, :log-start {0 0, 1 0}}
-  {:id "edc1710f-7697-7578-78d9-a0ae721ff9c7", :name "c3", :partitions 1, :alive false, :log-start {0 0}}
-  {:id "963da5a5-cefd-a89d-3d7b-844a87fa91d0", :name "c2", :partitions 2, :alive false, :log-start {0 7, 1 0}}]
+ :topics [{:id "c13f9fe8-25a2-4f98-22c3-4374c76936b8", :name "c0", :partitions 1, :alive true, :log-start {0 6}, :log-end {0 10}}
+  {:id "a673e439-a1bb-a2cb-2eda-c4c4024d7bf6", :name "c1", :partitions 1, :alive true, :log-start {0 9}, :log-end {0 12}}
+  {:id "4792faaf-193f-da09-0441-13651bee9409", :name "c2", :partitions 2, :alive false, :log-start {0 0, 1 0}, :log-end {0 3, 1 0}}
+  {:id "edc1710f-7697-7578-78d9-a0ae721ff9c7", :name "c3", :partitions 1, :alive false, :log-start {0 0}, :log-end {0 9}}
+  {:id "963da5a5-cefd-a89d-3d7b-844a87fa91d0", :name "c2", :partitions 2, :alive false, :log-start {0 7, 1 0}, :log-end {0 13, 1 11}}]
  :tasks [{:process "p0", :task 0, :receives [["4792faaf-193f-da09-0441-13651bee9409" 1] ["a673e439-a1bb-a2cb-2eda-c4c4024d7bf6" 0]]}
   {:process "p1", :task 0, :receives [["4792faaf-193f-da09-0441-13651bee9409" 0]]}
   {:process "p2", :task 0, :receives [["4792faaf-193f-da09-0441-13651bee9409" 1]]}]

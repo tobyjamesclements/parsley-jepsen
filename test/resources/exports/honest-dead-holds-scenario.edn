@@ -5,10 +5,10 @@
  :host-fault nil
  :trace-topic nil
  :processes {"q" {:receives ["chanA" "ct"], :sends ["chanB"]}, "p" {:receives ["chanA" "c9" "chanB"], :sends []}}
- :topics [{:id "c13f9fe8-25a2-4f98-22c3-4374c76936b8", :name "chanA", :partitions 1, :alive false, :log-start {0 0}}
-  {:id "a673e439-a1bb-a2cb-2eda-c4c4024d7bf6", :name "chanB", :partitions 1, :alive true, :log-start {0 0}}
-  {:id "4792faaf-193f-da09-0441-13651bee9409", :name "c9", :partitions 1, :alive true, :log-start {0 0}}
-  {:id "edc1710f-7697-7578-78d9-a0ae721ff9c7", :name "ct", :partitions 1, :alive true, :log-start {0 0}}]
+ :topics [{:id "c13f9fe8-25a2-4f98-22c3-4374c76936b8", :name "chanA", :partitions 1, :alive false, :log-start {0 0}, :log-end {0 1}}
+  {:id "a673e439-a1bb-a2cb-2eda-c4c4024d7bf6", :name "chanB", :partitions 1, :alive true, :log-start {0 0}, :log-end {0 1}}
+  {:id "4792faaf-193f-da09-0441-13651bee9409", :name "c9", :partitions 1, :alive true, :log-start {0 0}, :log-end {0 2}}
+  {:id "edc1710f-7697-7578-78d9-a0ae721ff9c7", :name "ct", :partitions 1, :alive true, :log-start {0 0}, :log-end {0 1}}]
  :tasks [{:process "q", :task 0, :receives [["c13f9fe8-25a2-4f98-22c3-4374c76936b8" 0] ["edc1710f-7697-7578-78d9-a0ae721ff9c7" 0]]}
   {:process "p", :task 0, :receives [["4792faaf-193f-da09-0441-13651bee9409" 0] ["a673e439-a1bb-a2cb-2eda-c4c4024d7bf6" 0] ["c13f9fe8-25a2-4f98-22c3-4374c76936b8" 0]]}]
  :start-positions [{:process "q", :task 0, :positions {["c13f9fe8-25a2-4f98-22c3-4374c76936b8" 0] 0, ["edc1710f-7697-7578-78d9-a0ae721ff9c7" 0] 0}}

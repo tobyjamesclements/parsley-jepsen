@@ -5,16 +5,16 @@
  :host-fault nil
  :trace-topic nil
  :processes {"p0" {:receives ["c1"], :sends ["c1" "c0"]}, "p1" {:receives ["c1"], :sends []}, "p2" {:receives ["c1" "c4" "c0"], :sends []}}
- :topics [{:id "c14b5dc1-9be3-b858-4bf4-bd8b2d402510", :name "c0", :partitions 2, :alive true, :log-start {0 1, 1 10}}
-  {:id "8275de2d-2d6a-115e-1e53-c268ecdeba41", :name "c1", :partitions 2, :alive true, :log-start {0 10, 1 1}}
-  {:id "8a06bb80-3d7f-1815-2bba-e2d74f27047b", :name "c2", :partitions 1, :alive false, :log-start {0 3}}
-  {:id "c58e3de1-5ec3-1116-0fe0-bda34da4baaf", :name "c3", :partitions 1, :alive false, :log-start {0 0}}
-  {:id "736b2054-0866-f0b4-3f9d-b2dde8b0af3c", :name "c4", :partitions 1, :alive false, :log-start {0 1}}
-  {:id "2318d950-4d26-39f4-7f5d-708868237095", :name "c2", :partitions 1, :alive false, :log-start {0 0}}
-  {:id "0cc1588e-ec51-49dc-3ed0-1689c8fed020", :name "c3", :partitions 1, :alive false, :log-start {0 0}}
-  {:id "23cc4e24-d11a-92f0-05f5-25e819ee7361", :name "c4", :partitions 1, :alive false, :log-start {0 0}}
-  {:id "01334ed3-c67d-8cf9-0a89-af3603ddd357", :name "c2", :partitions 1, :alive false, :log-start {0 0}}
-  {:id "f703699e-6e3e-5d08-6786-744ae6e44e26", :name "c4", :partitions 1, :alive false, :log-start {0 0}}]
+ :topics [{:id "c14b5dc1-9be3-b858-4bf4-bd8b2d402510", :name "c0", :partitions 2, :alive true, :log-start {0 1, 1 10}, :log-end {0 11, 1 10}}
+  {:id "8275de2d-2d6a-115e-1e53-c268ecdeba41", :name "c1", :partitions 2, :alive true, :log-start {0 10, 1 1}, :log-end {0 11, 1 9}}
+  {:id "8a06bb80-3d7f-1815-2bba-e2d74f27047b", :name "c2", :partitions 1, :alive false, :log-start {0 3}, :log-end {0 3}}
+  {:id "c58e3de1-5ec3-1116-0fe0-bda34da4baaf", :name "c3", :partitions 1, :alive false, :log-start {0 0}, :log-end {0 0}}
+  {:id "736b2054-0866-f0b4-3f9d-b2dde8b0af3c", :name "c4", :partitions 1, :alive false, :log-start {0 1}, :log-end {0 5}}
+  {:id "2318d950-4d26-39f4-7f5d-708868237095", :name "c2", :partitions 1, :alive false, :log-start {0 0}, :log-end {0 5}}
+  {:id "0cc1588e-ec51-49dc-3ed0-1689c8fed020", :name "c3", :partitions 1, :alive false, :log-start {0 0}, :log-end {0 6}}
+  {:id "23cc4e24-d11a-92f0-05f5-25e819ee7361", :name "c4", :partitions 1, :alive false, :log-start {0 0}, :log-end {0 0}}
+  {:id "01334ed3-c67d-8cf9-0a89-af3603ddd357", :name "c2", :partitions 1, :alive false, :log-start {0 0}, :log-end {0 6}}
+  {:id "f703699e-6e3e-5d08-6786-744ae6e44e26", :name "c4", :partitions 1, :alive false, :log-start {0 0}, :log-end {0 7}}]
  :tasks [{:process "p0", :task 0, :receives [["8275de2d-2d6a-115e-1e53-c268ecdeba41" 0] ["8a06bb80-3d7f-1815-2bba-e2d74f27047b" 0] ["c14b5dc1-9be3-b858-4bf4-bd8b2d402510" 0]]}
   {:process "p1", :task 0, :receives [["8275de2d-2d6a-115e-1e53-c268ecdeba41" 1] ["8a06bb80-3d7f-1815-2bba-e2d74f27047b" 0] ["c58e3de1-5ec3-1116-0fe0-bda34da4baaf" 0]]}
   {:process "p2", :task 0, :receives [["8275de2d-2d6a-115e-1e53-c268ecdeba41" 0] ["c14b5dc1-9be3-b858-4bf4-bd8b2d402510" 0] ["c58e3de1-5ec3-1116-0fe0-bda34da4baaf" 0]]}]

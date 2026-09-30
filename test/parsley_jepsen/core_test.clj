@@ -19,7 +19,7 @@
   {:format 1 :source :cluster :trace-topic "trace"
    :processes {"cycler" {:receives ["c"] :sends ["d" "loop" "trace"]}}
    :topics (vec (for [[name id] (assoc (dissoc ids "self") "c" new-c)]
-                  {:id id :name name :partitions 2 :alive true :log-start {0 0 1 0}}))
+                  {:id id :name name :partitions 2 :alive true :log-start {0 0 1 0} :log-end {0 3 1 0}}))
    :records [{:topic (ids "b") :partition 0 :offset 0 :key "sb1" :value "sb1" :uid "sb1" :causes nil}]
    :trace []})
 
