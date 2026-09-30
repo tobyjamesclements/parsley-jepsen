@@ -2,9 +2,11 @@
   "Jepsen's combined nemesis (network partitions, broker kill and restart, SIGSTOP pauses,
   clock skew) plus the Parsley-specific faults. Every Parsley fault op carries, in its
   value, the refusal reasons it justifies, which the checker reads: a refusal no earlier
-  fault justifies is an Operational 1/6 violation.
+  fault justifies is an Operational 1/6 violation. A fault that must produce a refusal also
+  carries :expect, the process and the reason, and the checker reports one that never came.
 
-  UNVERIFIED: written without a cluster or a Clojars-reachable build."
+  A refusal is terminal by design, so a refusal-class fault is scheduled at most once per
+  process per run: `plan` gives each requested fault a process no other fault has."
   (:require [clojure.tools.logging :refer [info warn]]
             [jepsen [control :as c]
                     [generator :as gen]
@@ -13,29 +15,258 @@
             [jepsen.nemesis.combined :as nc]
             [parsley-jepsen [client :as client]
                             [db :as db]])
-  (:import [java.util.concurrent TimeUnit]
-           [org.apache.kafka.clients.admin Admin NewPartitions NewTopic OffsetSpec RecordsToDelete]
+  (:import [java.util.concurrent ExecutionException TimeUnit]
+           [org.apache.kafka.clients.admin Admin NewPartitions OffsetSpec RecordsToDelete]
            [org.apache.kafka.clients.consumer OffsetAndMetadata]
-           [org.apache.kafka.common TopicPartition]))
+           [org.apache.kafka.clients.producer KafkaProducer RecordMetadata]
+           [org.apache.kafka.common IsolationLevel TopicPartition]))
 
-(def topics client/topics)
+(def instance-faults #{:instance-kill :instance-pause :wipe})
+
+(def refusal-targets
+  "The refusal-class faults in the README's order of expected yield, each with the
+  processes it can be aimed at, most preferred first, and the topic it acts on there.
+  :names is the received topic a manufactured hold's stamp names. A recreated topic is
+  never one external producers write, or their stamps would name a dead incarnation."
+  [[:truncate [["splitter" {:topic "src"}] ["joiner" {:topic "a"}]]]
+   [:delete-topic [["selfer" {:topic "self" :names "d"}]]]
+   [:recreate-topic [["cycler" {:topic "c"}] ["selfer" {:topic "d"}] ["joiner" {:topic "loop"}]]]
+   [:delete-changelog [["splitter" {}] ["cycler" {}] ["joiner" {}] ["selfer" {}]]]
+   [:add-partitions [["joiner" {:topic "a"}] ["selfer" {:topic "d"}]]]
+   [:restart-dropping [["joiner" {:topic "b" :names "a"}] ["selfer" {:topic "self" :names "d"}]]]
+   [:corrupt [["splitter" {:topic "src"}] ["joiner" {:topic "a"}]]]])
+
+(def refusal-faults (set (map first refusal-targets)))
+
+(defn plan
+  "Gives each requested refusal-class fault a process no other fault in the run has:
+  [[fault {:process p :topic t ...}] ...] in the order they will be injected. A fault left
+  without a process is dropped with a warning."
+  [faults]
+  (loop [remaining (filter (comp (set faults) first) refusal-targets)
+         taken #{}
+         planned []]
+    (if-let [[fault candidates] (first remaining)]
+      (if-let [[process target] (first (remove (comp taken first) candidates))]
+        (recur (rest remaining) (conj taken process) (conj planned [fault (assoc target :process process)]))
+        (do (warn "No process is left for the refusal-class fault" fault "- it is not scheduled in this run")
+            (recur (rest remaining) taken planned)))
+      planned)))
+
+;; ---- helpers ----
 
 (defn- with-admin [test f]
-  (with-open [admin (client/admin test)]
+  (with-open [admin (db/admin test)]
     (f admin)))
 
-(defn- log-end [^Admin admin ^TopicPartition tp]
-  (-> (.get (.all (.listOffsets admin {tp (OffsetSpec/latest)})) 30 TimeUnit/SECONDS) (get tp) .offset))
+(defn- get! [future]
+  (.get ^org.apache.kafka.common.KafkaFuture future 30 TimeUnit/SECONDS))
 
-(defn- committed [^Admin admin group ^TopicPartition tp]
-  (get (client/committed admin group) tp))
+(defn- kill-all! [test]
+  (c/on-nodes test (fn [t n] (db/kill-harness! t n))))
 
-(defn- on [node f]
-  (c/on-nodes {:nodes [node]} (fn [test node] (f node))))
+(defn- start-all! [test]
+  (c/on-nodes test (fn [t n] (db/start-harness! t n))))
+
+(defn- nodes-of [test value]
+  (if (= :all (:nodes value)) (:nodes test) [(:node value)]))
+
+(defn- committed [^Admin admin process ^TopicPartition tp]
+  (get (client/committed admin (client/group-id process)) tp))
+
+(defn- stable-end [^Admin admin ^TopicPartition tp]
+  (get (client/list-offsets admin [tp] (OffsetSpec/latest) IsolationLevel/READ_COMMITTED) tp))
+
+(defn- log-start [^Admin admin ^TopicPartition tp]
+  (get (client/list-offsets admin [tp] (OffsetSpec/earliest) IsolationLevel/READ_COMMITTED) tp))
+
+(defn- trace-high-watermarks
+  "The trace's high watermarks. Read while every instance is down, they are a boundary: a
+  trace record at or past them belongs to a step taken after the restart."
+  [test ^Admin admin]
+  (client/trace-ends admin (:partitions test) IsolationLevel/READ_UNCOMMITTED))
+
+(defn- await-group-empty!
+  "Waits until the group has no members, which altering its offsets requires."
+  [^Admin admin group]
+  (util/await-fn
+   (fn []
+     (let [description (get (get! (.all (.describeConsumerGroups admin [group]))) group)]
+       (when (seq (.members ^org.apache.kafka.clients.admin.ConsumerGroupDescription description))
+         (throw (ex-info "group still has members" {:group group})))))
+   {:retry-interval 2000 :log-interval 10000 :timeout 120000
+    :log-message (str "Waiting for group " group " to empty")}))
+
+(defn- await-topic-gone! [^Admin admin topic]
+  (util/await-fn
+   (fn []
+     (when (contains? (get! (.names (.listTopics admin))) topic)
+       (throw (ex-info "topic still listed" {:topic topic}))))
+   {:retry-interval 1000 :log-interval 10000 :timeout 120000
+    :log-message (str "Waiting for topic " topic " to be deleted")}))
+
+(defn- delete-topic! [^Admin admin ^String topic]
+  (get! (.all (.deleteTopics admin ^java.util.Collection (list topic))))
+  (await-topic-gone! admin topic))
+
+(defn- hold!
+  "Manufactures a held message: a record on `topic`'s partition whose stamp names a
+  position far past the log end of `names` there, so the receiving task reads it and holds
+  it. Waits until the task has committed reading past it. Returns {:held bool :held-at o}."
+  [test ^Admin admin {:keys [process topic names partition]}]
+  (let [ids (client/topic-ids test admin)
+        named (+ 1000000 (client/log-end admin (TopicPartition. names (int partition))))
+        uid (str "held-" topic "-" partition)
+        tp (TopicPartition. topic (int partition))
+        md (with-open [producer ^KafkaProducer (client/producer test)]
+             ^RecordMetadata (.get (.send producer (client/record {:topic topic :partition partition :key uid :uid uid
+                                                                   :stamp {[(get ids names) partition] named}}))
+                                   30 TimeUnit/SECONDS))
+        offset (.offset ^RecordMetadata md)
+        held (try (util/await-fn
+                   (fn []
+                     (when-not (some-> (committed admin process tp) (> offset))
+                       (throw (ex-info "not yet read" {})))
+                     true)
+                   {:retry-interval 1000 :log-interval 10000 :timeout 60000
+                    :log-message (str "Waiting for " process " to read the held record at " tp "@" offset)})
+                  (catch Exception _ false))]
+    {:held held :held-at offset :held-uid uid :named [(get ids names) partition named]}))
+
+;; ---- the faults ----
+
+(defn- truncate!
+  "Delete records past a lagging task's committed position. Every instance is killed so the
+  task lags behind what external producers keep sending, the records just past its
+  committed position are deleted, and the restart's first fetch finds them gone."
+  [test {:keys [process topic partition]}]
+  (let [tp (TopicPartition. topic (int partition))]
+    (kill-all! test)
+    (try
+      (with-admin test
+        (fn [^Admin admin]
+          (let [position (or (committed admin process tp) 0)
+                end (try (util/await-fn
+                          (fn [] (let [end (stable-end admin tp)]
+                                   (when (< end (+ position 2)) (throw (ex-info "no lag yet" {})))
+                                   end))
+                          {:retry-interval 1000 :log-interval 10000 :timeout 45000
+                           :log-message (str "Waiting for " tp " to grow past " process "'s committed position")})
+                         (catch Exception _ (stable-end admin tp)))
+                to (min end (+ position 1 (rand-int 3)))]
+            (when (> to position)
+              (get! (.all (.deleteRecords admin {tp (RecordsToDelete/beforeOffset to)}))))
+            (cond-> {:committed position :to to :end end :channel [topic partition]}
+              (> to position) (assoc :expect {:process process :refusal :POSITIONS_DISCARDED_UNREAD})))))
+      (finally (start-all! test)))))
+
+(defn- discard-held-copy!
+  "Retention discards a held message's copy: delete records up to a task's committed
+  position, which removes copies of messages it holds but nothing it has not read. No
+  refusal: the hold delivers from the ordering changelog in order."
+  [test {:keys [process topic partition]}]
+  (let [tp (TopicPartition. topic (int partition))]
+    (with-admin test
+      (fn [^Admin admin]
+        (let [position (or (committed admin process tp) 0)]
+          (when (pos? position)
+            (get! (.all (.deleteRecords admin {tp (RecordsToDelete/beforeOffset position)}))))
+          {:to position :channel [topic partition]})))))
+
+(defn- delete-topic!!
+  "Delete a received topic while a message is held from it."
+  [test {:keys [process topic] :as v}]
+  (with-admin test
+    (fn [^Admin admin]
+      (let [id (get (client/topic-ids test admin) topic)
+            held (hold! test admin v)]
+        (swap! (:gone-topics test) conj topic)
+        (delete-topic! admin topic)
+        (cond-> (assoc held :channel [id 0])
+          (:held held) (assoc :expect {:process process :refusal :CHANNEL_DELETED_WITH_UNDELIVERED_MESSAGES}))))))
+
+(defn- recreate-topic!
+  "Delete and recreate a received topic under the same name while every instance is down:
+  the next start finds a different topic id."
+  [test {:keys [process topic]}]
+  (kill-all! test)
+  (try
+    (with-admin test
+      (fn [^Admin admin]
+        (let [old (get (client/topic-ids test admin) topic)
+              ends (trace-high-watermarks test admin)]
+          (delete-topic! admin topic)
+          (db/create-topics! test [topic])
+          (let [new (get (client/describe-ids admin [topic]) topic)]
+            {:old old :new new :reinitialised-ends ends
+             :expect {:process process :refusal :CHANNEL_IDENTITY_CHANGED}}))))
+    (finally (start-all! test))))
+
+(defn- reset-offsets!
+  "Reset the group's offsets backwards while every instance is down: the re-fed records
+  are dropped as already delivered, and no refusal is justified."
+  [test {:keys [process topic partition back]}]
+  (let [tp (TopicPartition. topic (int partition))
+        group (client/group-id process)]
+    (kill-all! test)
+    (try
+      (with-admin test
+        (fn [^Admin admin]
+          (await-group-empty! admin group)
+          (let [position (or (committed admin process tp) 0)
+                target (max (log-start admin tp) (- position back))]
+            (when (< target position)
+              (get! (.all (.alterConsumerGroupOffsets admin group {tp (OffsetAndMetadata. target)}))))
+            {:from position :to target :channel [topic partition]})))
+      (finally (start-all! test)))))
+
+(defn- delete-changelog!
+  "Delete the ordering changelog and every instance's local state, keeping the group's
+  offsets: the causal past is gone while the positions say it should exist."
+  [test {:keys [process]}]
+  (let [changelog (str (client/group-id process) "-__parsley.ordering-changelog")]
+    (kill-all! test)
+    (try
+      (with-admin test (fn [^Admin admin] (delete-topic! admin changelog)))
+      (c/on-nodes test (fn [t n] (db/wipe-harness-state! t n)))
+      {:changelog changelog :expect {:process process :refusal :ORDERING_STATE_LOST}}
+      (finally (start-all! test)))))
+
+(defn- add-partitions!
+  "Add a partition to a received topic while every instance is down."
+  [test {:keys [process topic]}]
+  (kill-all! test)
+  (try
+    (with-admin test
+      (fn [^Admin admin]
+        (get! (.all (.createPartitions admin {topic (NewPartitions/increaseTo (int (inc (:partitions test))))})))
+        {:partitions (inc (:partitions test)) :expect {:process process :refusal :TASK_WIDTH_CHANGED}}))
+    (finally (start-all! test))))
+
+(defn- restart-dropping!
+  "Restart every instance with a declaration dropping a topic a message is held from."
+  [test {:keys [process topic] :as v}]
+  (let [held (with-admin test (fn [^Admin admin] (hold! test admin v)))]
+    (kill-all! test)
+    (try
+      (let [ends (with-admin test (fn [^Admin admin] (trace-high-watermarks test admin)))]
+        (swap! (:dropped-topics test) conj topic)
+        (cond-> (assoc held :trace-ends ends)
+          (:held held) (assoc :expect {:process process :refusal :CHANNEL_REMOVED_WITH_HELD_MESSAGES})))
+      (finally (start-all! test)))))
+
+(def justifies
+  "The refusal reasons each fault justifies once injected."
+  {:truncate #{:POSITIONS_DISCARDED_UNREAD}
+   :delete-topic #{:CHANNEL_DELETED_WITH_UNDELIVERED_MESSAGES :CHANNEL_IDENTITY_CHANGED}
+   :recreate-topic #{:CHANNEL_IDENTITY_CHANGED :CHANNEL_DELETED_WITH_UNDELIVERED_MESSAGES}
+   :delete-changelog #{:ORDERING_STATE_LOST}
+   :add-partitions #{:TASK_WIDTH_CHANGED}
+   :restart-dropping #{:CHANNEL_REMOVED_WITH_HELD_MESSAGES}})
 
 (defn parsley-nemesis
-  "The Parsley-specific faults. Each :f names a fault; :value carries its target and the
-  refusals it justifies once applied."
+  "The Parsley-specific faults. Each :f names a fault; :value carries its target and,
+  once applied, the refusals it justifies."
   []
   (reify
     nemesis/Reflection
@@ -47,151 +278,114 @@
     (setup! [this test] this)
 
     (invoke! [this test op]
-      (let [{:keys [node] :as v} (:value op)
-            done (fn [extra justifies]
-                   (assoc op :type :info :value (merge v extra {:justifies justifies})))]
-        (case (:f op)
-          :kill-instance
-          (do (c/on-nodes test [node] (fn [t n] (db/kill-harness! t n)))
-              (done {} #{}))
+      (let [v (:value op)
+            f (:f op)
+            ;; A fault that fails part-way may still have been applied, so it justifies
+            ;; what it would have justified.
+            result (try
+                     (case f
+                       :kill-instance
+                       (do (c/on-nodes test (nodes-of test v) (fn [t n] (db/kill-harness! t n))) {})
 
-          :restart-instance
-          (do (c/on-nodes test [node] (fn [t n] (db/start-harness! t n)))
-              (done {} #{}))
+                       :restart-instance
+                       (do (c/on-nodes test (nodes-of test v) (fn [t n] (db/start-harness! t n))) {})
 
-          ;; A pause past the transaction timeout: the resumed instance is a zombie the host
-          ;; must fence (SPEC Host obligation 6); no refusal is justified.
-          :pause-instance
-          (do (c/on-nodes test [node] (fn [t n] (db/pause-harness! t n)))
-              (done {} #{}))
+                       ;; A pause past the transaction timeout: the resumed instance is a zombie
+                       ;; the host must fence (SPEC Host obligation 6); no refusal is justified.
+                       :pause-instance
+                       (do (c/on-nodes test (nodes-of test v) (fn [t n] (db/pause-harness! t n))) {})
 
-          :resume-instance
-          (do (c/on-nodes test [node] (fn [t n] (db/resume-harness! t n)))
-              (done {} #{}))
+                       :resume-instance
+                       (do (c/on-nodes test (nodes-of test v) (fn [t n] (db/resume-harness! t n))) {})
 
-          :wipe-restart-instance
-          (do (c/on-nodes test [node] (fn [t n] (db/kill-harness! t n) (db/wipe-harness-state! t n) (db/start-harness! t n)))
-              (done {} #{}))
+                       :wipe-restart-instance
+                       (do (c/on-nodes test (nodes-of test v)
+                                       (fn [t n] (db/kill-harness! t n) (db/wipe-harness-state! t n) (db/start-harness! t n)))
+                           {})
 
-          ;; Restart every instance with a declaration dropping a topic: a channel still holding
-          ;; messages refuses CHANNEL_REMOVED_WITH_HELD_MESSAGES; an empty one settles.
-          :restart-dropping
-          (do (c/on-nodes test (fn [t n] (db/kill-harness! t n) (db/start-harness! t n [(:topic v)])))
-              (done {} #{:CHANNEL_REMOVED_WITH_HELD_MESSAGES}))
-
-          ;; Delete records past a lagging task's committed position: the fetch at that position
-          ;; refuses POSITIONS_DISCARDED_UNREAD, and nothing delivers past the gap.
-          :truncate
-          (let [{:keys [topic partition process]} v
-                tp (TopicPartition. topic partition)
-                result (with-admin test
-                         (fn [^Admin admin]
-                           (let [position (or (committed admin (str db/app-prefix "-" process) tp) 0)
-                                 end (log-end admin tp)
-                                 to (min end (+ position 1 (rand-int 3)))]
-                             (.get (.all (.deleteRecords admin {tp (RecordsToDelete/beforeOffset to)})) 30 TimeUnit/SECONDS)
-                             {:committed position :to to :channel [topic partition]})))]
-            (done result #{:POSITIONS_DISCARDED_UNREAD}))
-
-          ;; Retention discards a held message's copy: delete records up to a task's committed
-          ;; position, which removes copies of messages it holds but nothing it has not read.
-          ;; No refusal: the hold delivers from the ordering changelog in order.
-          :discard-held-copy
-          (let [{:keys [topic partition process]} v
-                tp (TopicPartition. topic partition)
-                result (with-admin test
-                         (fn [^Admin admin]
-                           (let [position (or (committed admin (str db/app-prefix "-" process) tp) 0)]
-                             (.get (.all (.deleteRecords admin {tp (RecordsToDelete/beforeOffset position)})) 30 TimeUnit/SECONDS)
-                             {:to position :channel [topic partition]})))]
-            (done result #{}))
-
-          :delete-topic
-          (do (with-admin test (fn [^Admin admin] (.get (.all (.deleteTopics admin [(:topic v)])) 30 TimeUnit/SECONDS)))
-              (done {} #{:CHANNEL_DELETED_WITH_UNDELIVERED_MESSAGES :CHANNEL_IDENTITY_CHANGED}))
-
-          ;; Delete and recreate under the same name while every instance is down: the next start
-          ;; refuses CHANNEL_IDENTITY_CHANGED.
-          :recreate-topic
-          (let [n (count (:nodes test))
-                old (with-admin test (fn [^Admin admin] (get (client/topic-ids admin) (:topic v))))]
-            (c/on-nodes test (fn [t n] (db/kill-harness! t n)))
-            (with-admin test
-              (fn [^Admin admin]
-                (.get (.all (.deleteTopics admin [(:topic v)])) 30 TimeUnit/SECONDS)
-                (util/await-fn (fn [] (.get (.all (.createTopics admin [(NewTopic. ^String (:topic v) (int (:partitions test)) (short (min 3 n)))])) 30 TimeUnit/SECONDS))
-                               {:retry-interval 1000 :log-interval 10000 :log-message "recreating"})))
-            (let [new (with-admin test (fn [^Admin admin] (get (client/topic-ids admin) (:topic v))))]
-              (c/on-nodes test (fn [t n] (db/start-harness! t n)))
-              (done {:old old :new new :reinitialised-ends nil} #{:CHANNEL_IDENTITY_CHANGED :CHANNEL_DELETED_WITH_UNDELIVERED_MESSAGES})))
-
-          ;; Reset the group's offsets backwards while every instance is down: re-fed records are
-          ;; dropped as duplicates, nothing delivers twice, and no refusal is justified.
-          :reset-offsets
-          (let [{:keys [process topic partition back]} v
-                tp (TopicPartition. topic partition)
-                group (str db/app-prefix "-" process)]
-            (c/on-nodes test (fn [t n] (db/kill-harness! t n)))
-            (let [result (with-admin test
-                           (fn [^Admin admin]
-                             (let [position (or (committed admin group tp) 0)
-                                   target (max 0 (- position back))]
-                               (.get (.all (.alterConsumerGroupOffsets admin group {tp (OffsetAndMetadata. target)})) 30 TimeUnit/SECONDS)
-                               {:from position :to target :channel [topic partition]})))]
-              (c/on-nodes test (fn [t n] (db/start-harness! t n)))
-              (done result #{})))
-
-          ;; Delete the ordering changelog, keeping the group's offsets: ORDERING_STATE_LOST.
-          :delete-changelog
-          (let [changelog (str db/app-prefix "-" (:process v) "-__parsley.ordering-changelog")]
-            (c/on-nodes test (fn [t n] (db/kill-harness! t n)))
-            (with-admin test (fn [^Admin admin] (.get (.all (.deleteTopics admin [changelog])) 30 TimeUnit/SECONDS)))
-            (c/on-nodes test (fn [t n] (db/wipe-harness-state! t n) (db/start-harness! t n)))
-            (done {:changelog changelog} #{:ORDERING_STATE_LOST}))
-
-          ;; Add partitions to the widest received topic, then restart: TASK_WIDTH_CHANGED.
-          :add-partitions
-          (do (c/on-nodes test (fn [t n] (db/kill-harness! t n)))
-              (with-admin test (fn [^Admin admin]
-                                 (.get (.all (.createPartitions admin {(:topic v) (NewPartitions/increaseTo (int (inc (:partitions test))))})) 30 TimeUnit/SECONDS)))
-              (c/on-nodes test (fn [t n] (db/start-harness! t n)))
-              (done {} #{:TASK_WIDTH_CHANGED})))))
+                       :truncate (truncate! test v)
+                       :discard-held-copy (discard-held-copy! test v)
+                       :delete-topic (delete-topic!! test v)
+                       :recreate-topic (recreate-topic! test v)
+                       :reset-offsets (reset-offsets! test v)
+                       :delete-changelog (delete-changelog! test v)
+                       :add-partitions (add-partitions! test v)
+                       :restart-dropping (restart-dropping! test v))
+                     (catch Exception e
+                       (warn e "Fault" f "failed part-way")
+                       {:error (str (.getName (class e)) ": " (.getMessage e))}))]
+        (assoc op :type :info :value (merge v result {:justifies (get justifies f #{})}))))
 
     (teardown! [this test])))
 
-(defn parsley-generator
-  "Instance faults every interval; a refusal-class fault at most once per process and only
-  when asked for, since a refusal is terminal by design."
-  [opts]
-  (let [faults (:nemesis opts)
-        interval (:nemesis-interval opts 60)
-        node (fn [test] (rand-nth (:nodes test)))
-        instance (gen/mix (remove nil?
-                                  [(when (:instance-kill faults)
-                                     (fn [test _] {:type :info :f :kill-instance :value {:node (node test)}}))
-                                   (when (:instance-kill faults)
-                                     (fn [test _] {:type :info :f :restart-instance :value {:node (node test)}}))
-                                   (when (:instance-pause faults)
-                                     (gen/cycle [(fn [test _] {:type :info :f :pause-instance :value {:node (node test)}})
-                                                 (gen/sleep 120)
-                                                 (fn [test _] {:type :info :f :resume-instance :value {:node (node test)}})]))
-                                   (when (:wipe faults)
-                                     (fn [test _] {:type :info :f :wipe-restart-instance :value {:node (node test)}}))]))
-        once (fn [f value] (when (faults f) (gen/once-per-test? nil)))]
-    (gen/stagger interval instance)))
+(defn- instance-generator
+  "Instance faults: a kill is followed by a restart of whatever is down, a pause by a
+  resume, so each lasts about one interval, which is past the transaction timeout."
+  [faults]
+  (let [node (fn [test] (rand-nth (:nodes test)))
+        all {:nodes :all}]
+    (gen/mix
+     (remove nil?
+             [(when (:instance-kill faults)
+                (gen/flip-flop (fn [test _] {:type :info :f :kill-instance :value {:node (node test)}})
+                               (gen/repeat {:type :info :f :restart-instance :value all})))
+              (when (:instance-pause faults)
+                (gen/flip-flop (fn [test _] {:type :info :f :pause-instance :value {:node (node test)}})
+                               (gen/repeat {:type :info :f :resume-instance :value all})))
+              (when (:wipe faults)
+                (fn [test _] {:type :info :f :wipe-restart-instance :value {:node (node test)}}))]))))
+
+(defn- topic-generator
+  "Faults on the logs that justify no refusal, on a random received partition."
+  [faults]
+  (let [target (fn [test]
+                 (let [[process received] (rand-nth (seq client/processes))
+                       received (remove @(:gone-topics test) received)]
+                   (when (seq received)
+                     {:process process :topic (rand-nth received) :partition (rand-int (:partitions test))})))]
+    (gen/mix
+     (remove nil?
+             [(when (:discard-held-copy faults)
+                (fn [test _] (when-let [t (target test)] {:type :info :f :discard-held-copy :value t})))
+              (when (:reset-offsets faults)
+                (fn [test _] (when-let [t (target test)]
+                               {:type :info :f :reset-offsets :value (assoc t :back (inc (rand-int 5)))})))]))))
+
+(defn- refusal-generator
+  "The planned refusal-class faults, one per interval after a first interval of plain
+  running. :corrupt is a client's send, which the workload schedules."
+  [opts planned]
+  (let [ops (for [[fault target] planned
+                  :when (not= :corrupt fault)]
+              {:type :info :f fault :value (assoc target :partition (rand-int (:partitions opts)))})]
+    (when (seq ops)
+      [(gen/sleep (:nemesis-interval opts 60))
+       (gen/delay (:nemesis-interval opts 60) ops)])))
 
 (defn parsley-package
   "A nemesis package in jepsen.nemesis.combined's shape, for the Parsley faults."
-  [opts]
-  {:nemesis (parsley-nemesis)
-   :generator (parsley-generator opts)
-   :final-generator (fn [test _] (map (fn [node] {:type :info :f :restart-instance :value {:node node}}) (:nodes test)))
-   :perf #{{:name "instance" :fs #{:kill-instance :restart-instance :pause-instance :resume-instance} :color "#E9A4A0"}}})
+  [opts planned]
+  (let [faults (:nemesis opts)
+        interval (:nemesis-interval opts 60)
+        instance (instance-generator faults)
+        topic (topic-generator faults)
+        refusal (refusal-generator opts planned)
+        generators (remove nil? [(when instance (gen/stagger interval instance))
+                                 (when topic (gen/stagger interval topic))
+                                 refusal])]
+    {:nemesis (parsley-nemesis)
+     :generator (when (seq generators) (apply gen/any generators))
+     :final-generator [{:type :info :f :resume-instance :value {:nodes :all}}
+                       {:type :info :f :restart-instance :value {:nodes :all}}]
+     :perf #{{:name "instance-kill" :start #{:kill-instance} :stop #{:restart-instance} :color "#E9A4A0"}
+             {:name "instance-pause" :start #{:pause-instance} :stop #{:resume-instance} :color "#A0B1E9"}
+             {:name "parsley-fault" :fs (conj refusal-faults :wipe-restart-instance :discard-held-copy :reset-offsets)
+              :color "#C5A0E9"}}}))
 
 (defn package
   "The combined nemesis: Jepsen's partition, kill, pause and clock faults over the brokers,
-  and the Parsley faults over the instances and the topics."
-  [opts]
+  and the Parsley faults over the instances and the topics. `planned` is `plan`'s answer."
+  [opts planned]
   (let [faults (:nemesis opts)
         combined (nc/nemesis-package {:db (:db opts)
                                       :interval (:nemesis-interval opts 60)
@@ -200,4 +394,4 @@
                                       :kill {:targets [:one]}
                                       :pause {:targets [:one]}
                                       :clock {:targets [:one]}})]
-    (nc/compose-packages [combined (parsley-package opts)])))
+    (nc/compose-packages [combined (parsley-package opts planned)])))
