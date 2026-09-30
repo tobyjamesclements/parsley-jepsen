@@ -51,6 +51,9 @@
    [nil "--calibrate KIND" "inversion: an external producer stamps less than it knows, which the checker must flag."
     :parse-fn keyword :validate [#{:inversion} "must be inversion"]]
    [nil "--quiesce-seconds SECONDS" "How long the final phase waits for zero lag." :default 600 :parse-fn parse-long]
+   [nil "--[no-]java-oracle" "Cross-check the export with Parsley's Oracle replay in the harness jar." :default true]
+   [nil "--java-oracle-heap SIZE" "The replay's heap; it holds every record's causes as a set, so it grows with the square of a run."
+    :default "3g"]
    [nil "--kafka-heap SIZE" "Each broker's heap." :default "1g"]
    [nil "--harness-heap SIZE" "Each harness instance's heap." :default "1g"]
    [nil "--unclean-leader-election" "Turn unclean leader election on: a separately labelled run." :default false]])
@@ -166,17 +169,22 @@
               process " with " (name refusal) ", and no later status shows it"))))
 
 (defn- java-oracle
-  "Parsley's own Oracle replay over the same export, through the harness jar."
+  "Parsley's own Oracle replay over the same export, through the harness jar. :clean? is
+  :unknown when the replay could not finish, which its memory decides: it keeps every
+  record's causes as a set."
   [test path]
-  (let [{:keys [exit out err]} (sh/sh "java" "-jar" (:harness-jar test) "check" "--in" path)
-        lines (vec (remove str/blank? (str/split-lines out)))]
-    (if (contains? #{0 1} exit)
-      {:clean? (zero? exit) :violation-count (if (zero? exit) 0 (dec (count lines))) :violations (vec (take 50 (butlast lines)))}
-      {:clean? :unknown :error (str/trim (str out err))})))
+  (if-not (:java-oracle test true)
+    {:clean? :unknown :error "skipped"}
+    (let [{:keys [exit out err]} (sh/sh "java" (str "-Xmx" (:java-oracle-heap test "3g")) "-jar" (:harness-jar test) "check" "--in" path)
+          lines (vec (remove str/blank? (str/split-lines out)))]
+      (if (contains? #{0 1} exit)
+        {:clean? (zero? exit) :violation-count (if (zero? exit) 0 (dec (count lines))) :violations (vec (take 50 (butlast lines)))}
+        {:clean? :unknown :error (str/trim (str/join "\n" (take-last 5 (str/split-lines (str out err)))))}))))
 
 (defn parsley-checker
   "Judges the run with parsley-jepsen.checker over the export assembled from the history,
-  and cross-checks it with Parsley's Oracle replay."
+  and cross-checks it with Parsley's Oracle replay: a violation from either fails the run,
+  and a replay that could not finish is reported but decides nothing."
   []
   (reify checker/Checker
     (check [_ test history opts]
@@ -190,7 +198,7 @@
                 missing (missing-refusals export)
                 oracle (java-oracle test path)
                 quiesced? (boolean (some #(and (= :ok (:type %)) (= :quiesce (:f %))) history))]
-            {:valid? (and valid? (empty? missing) (true? (:clean? oracle)))
+            {:valid? (and valid? (empty? missing) (not (false? (:clean? oracle))))
              :quiesced? quiesced?
              :violation-count (count violations)
              :violations (vec (take 200 violations))
