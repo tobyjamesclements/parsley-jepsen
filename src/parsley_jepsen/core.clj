@@ -115,7 +115,9 @@
         injected (loop [pairs (nemesis-faults history) dropped #{} faults []]
                    (if-let [[invocation completion] (first pairs)]
                      (let [v (:value completion)
-                           details (if (map? v) (dissoc v :justifies) {:value (pr-str v)})
+                           ;; Jepsen's own nemeses carry values of their own shapes, some with
+                           ;; doubles the Java reader has no use for: those are kept as text.
+                           details (if (and (map? v) (contains? v :justifies)) (dissoc v :justifies) {:value (pr-str v)})
                            details (if (and (= :reset-offsets (:f completion)) (:to v))
                                      (assoc details :rewound {[(get ids (:topic v)) (:partition v)] (:to v)})
                                      details)
@@ -189,10 +191,13 @@
   (if-not (:java-oracle test true)
     {:clean? :unknown :error "skipped"}
     (let [{:keys [exit out err]} (sh/sh "java" (str "-Xmx" (:java-oracle-heap test "3g")) "-jar" (:harness-jar test) "check" "--in" path)
-          lines (vec (remove str/blank? (str/split-lines out)))]
-      (if (contains? #{0 1} exit)
-        {:clean? (zero? exit) :violation-count (if (zero? exit) 0 (dec (count lines))) :violations (vec (take 50 (butlast lines)))}
-        {:clean? :unknown :error (str/trim (str/join "\n" (take-last 5 (str/split-lines (str out err)))))}))))
+          lines (vec (remove str/blank? (str/split-lines out)))
+          verdict (last lines)]
+      (cond
+        (= "clean" verdict) {:clean? true :violation-count 0 :violations []}
+        (and (= 1 exit) verdict (re-find #"^\d+ violations$" verdict))
+        {:clean? false :violation-count (dec (count lines)) :violations (vec (take 50 (butlast lines)))}
+        :else {:clean? :unknown :error (str/trim (str/join "\n" (take-last 5 (str/split-lines (str out err)))))}))))
 
 (defn parsley-checker
   "Judges the run with parsley-jepsen.checker over the export assembled from the history,
