@@ -14,7 +14,8 @@
                     [util :as util]]
             [jepsen.nemesis.combined :as nc]
             [parsley-jepsen [client :as client]
-                            [db :as db]])
+                            [db :as db]
+                            [workload :refer [after]]])
   (:import [java.util.concurrent ExecutionException TimeUnit]
            [org.apache.kafka.clients.admin Admin NewPartitions OffsetSpec RecordsToDelete]
            [org.apache.kafka.clients.consumer OffsetAndMetadata]
@@ -70,6 +71,12 @@
 (defn- kill-all! [test]
   (c/on-nodes test (fn [t n] (db/kill-harness! t n))))
 
+(defn- stop-all!
+  "Stops every instance gracefully, so their groups are left rather than held until the
+  session timeout."
+  [test]
+  (c/on-nodes test (fn [t n] (db/stop-harness! t n))))
+
 (defn- start-all! [test]
   (c/on-nodes test (fn [t n] (db/start-harness! t n))))
 
@@ -96,8 +103,10 @@
   [^Admin admin group]
   (util/await-fn
    (fn []
-     (let [description (get (get! (.all (.describeConsumerGroups admin [group]))) group)]
-       (when (seq (.members ^org.apache.kafka.clients.admin.ConsumerGroupDescription description))
+     (let [description ^org.apache.kafka.clients.admin.ConsumerGroupDescription
+           (get (get! (.all (.describeConsumerGroups admin [group]))) group)]
+       (when (seq (.members description))
+         (info "Group" group "is" (str (.groupState description)) "with" (count (.members description)) "members")
          (throw (ex-info "group still has members" {:group group})))))
    {:retry-interval 2000 :log-interval 10000 :timeout 120000
     :log-message (str "Waiting for group " group " to empty")}))
@@ -209,11 +218,13 @@
 
 (defn- reset-offsets!
   "Reset the group's offsets backwards while every instance is down: the re-fed records
-  are dropped as already delivered, and no refusal is justified."
+  are dropped as already delivered, and no refusal is justified. The instances are stopped
+  gracefully, since altering a group's offsets needs it empty, and a killed member holds
+  its place for the session timeout."
   [test {:keys [process topic partition back]}]
   (let [tp (TopicPartition. topic (int partition))
         group (client/group-id process)]
-    (kill-all! test)
+    (stop-all! test)
     (try
       (with-admin test
         (fn [^Admin admin]
@@ -364,8 +375,7 @@
                   :when (not= :corrupt fault)]
               {:type :info :f (get op-f fault fault) :value (assoc target :partition (rand-int (:partitions opts)))})]
     (when (seq ops)
-      [(gen/sleep (:nemesis-interval opts 60))
-       (gen/delay (:nemesis-interval opts 60) ops)])))
+      (after (:nemesis-interval opts 60) (gen/delay (:nemesis-interval opts 60) ops)))))
 
 (defn parsley-package
   "A nemesis package in jepsen.nemesis.combined's shape, for the Parsley faults."
@@ -375,8 +385,10 @@
         instance (instance-generator faults)
         topic (topic-generator faults)
         refusal (refusal-generator opts planned)
-        generators (remove nil? [(when instance (gen/stagger interval instance))
-                                 (when topic (gen/stagger interval topic))
+        ;; Every fault waits out one interval first: stagger can emit its first op at once,
+        ;; before an instance has finished starting.
+        generators (remove nil? [(after interval (gen/stagger interval instance))
+                                 (after interval (gen/stagger interval topic))
                                  refusal])]
     {:nemesis (parsley-nemesis)
      :generator (when (seq generators) (apply gen/any generators))

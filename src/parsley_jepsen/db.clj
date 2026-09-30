@@ -226,6 +226,18 @@
   (c/su (signal-matching! :KILL harness-pattern)
         (c/exec :rm :-f harness-pid)))
 
+(defn stop-harness!
+  "Stops the instance gracefully: SIGTERM runs the harness's shutdown hook, which closes
+  every process and leaves its groups, and a kill follows if it has not exited in time."
+  [test node]
+  (c/su (when (signal-matching! :TERM harness-pattern)
+          (try (util/await-fn (fn [] (when (signal-matching! :CONT harness-pattern)
+                                       (throw (ex-info "still running" {}))))
+                              {:retry-interval 1000 :log-interval 10000 :timeout 60000
+                               :log-message "Waiting for the harness to exit"})
+               (catch Exception _ (warn "The harness on" node "did not exit on SIGTERM; killing it"))))
+        (kill-harness! test node)))
+
 (defn wipe-harness-state!
   "Removes the instance's local state directory; the ordering state must rebuild from its
   changelog at the next start."

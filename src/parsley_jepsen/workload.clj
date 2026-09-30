@@ -13,6 +13,26 @@
   than it knows, which the checker must flag."
   (:require [jepsen.generator :as gen]))
 
+(defrecord After [deadline gen]
+  gen/Generator
+  (op [_ test ctx]
+    (when-let [[op gen'] (gen/op gen test ctx)]
+      (if (= :pending op)
+        [:pending (After. deadline gen')]
+        [(if (< (:time op) deadline) (assoc op :time deadline) op) (After. deadline gen')])))
+  (update [_ test ctx event]
+    (After. deadline (gen/update gen test ctx event))))
+
+(defn after
+  "A generator whose first op from `gen` is scheduled no earlier than `seconds` into the
+  test's clock, however many threads are free: a sleep op only holds the thread that
+  performs it, so a sequence of a sleep and an op runs the op at once on another thread.
+  The deadline is on the clock, not from the first ask, since a generator that is asked and
+  not chosen keeps its old state."
+  [seconds gen]
+  (when gen
+    (After. (long (* seconds 1e9)) gen)))
+
 (defn acked
   "The atom in the test map where the client records every acknowledged send, as
   {:uid u :topic t :topic-id id :partition p :offset o :causes {...}}; the generator stamps
@@ -114,7 +134,7 @@
         sends (gen/stagger (/ 1 (:rate opts 5)) sends)
         observations (gen/stagger 1/2 (gen/mix [status-op reads-op]))
         corrupt (when corrupt-topic
-                  [(gen/sleep (:nemesis-interval opts 60)) (malformed-send corrupt-topic)])
+                  (after (:nemesis-interval opts 60) (malformed-send corrupt-topic)))
         main (gen/any sends observations corrupt)]
     (if (= :inversion (:calibrate opts))
       (gen/phases (inversion) main)
