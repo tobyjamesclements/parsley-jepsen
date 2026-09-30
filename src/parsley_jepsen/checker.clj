@@ -250,6 +250,20 @@
 (defn- in-span? [[from to] position]
   (and (>= position from) (< position to)))
 
+(defn- merged-spans
+  "The union of spans as disjoint spans in ascending order. Every observation of a task
+  contributes a span, most of them nested in the next, so walking the records of each
+  span in turn walks the same records once per observation; walking the union walks them
+  once."
+  [spans]
+  (reduce (fn [merged [from to]]
+            (let [[last-from last-to] (peek merged)]
+              (if (and last-to (<= from last-to))
+                (conj (pop merged) [last-from (max last-to to)])
+                (conj merged [from to]))))
+          []
+          (sort spans)))
+
 ;; ---- ground truth: true causes ----
 
 (declare past-after)
@@ -300,7 +314,7 @@
                                 done (get merged channel #{})]
                             (if (nil? records)
                               [acc merged]
-                              (let [fresh (for [[from to] (received-spans-before m task channel delivered)
+                              (let [fresh (for [[from to] (merged-spans (received-spans-before m task channel delivered))
                                                 [offset r] (subseq records >= from < to)
                                                 :when (not (contains? done offset))]
                                             r)
@@ -334,7 +348,7 @@
                                 bound
                                 (when records (subseq records >= from < to))))
                       bound
-                      (received-spans-up-to m task channel entry))))
+                      (merged-spans (received-spans-up-to m task channel entry)))))
           (reduce (fn [bound [id partition offset]] (update bound [id partition] (fnil max -1) offset)) {} delivered-positions)
           (received-ever m task)))
 

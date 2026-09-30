@@ -3,9 +3,11 @@
   and one instance of the Parsley harness app per node under the same application-id
   prefix. Install, configure, format, start, stop, kill, pause, logs.
 
-  Setup runs on every node at once and meets at two barriers: once every broker process
-  has been started, the primary node waits for every broker to register and creates the
-  topics; once the topics exist, every node starts its harness instance."
+  Setup runs on every node at once and meets at three barriers: every broker starts only
+  once every node is installed and formatted, since a broker that cannot register with the
+  controller quorum within a minute exits; once every broker process has been started, the
+  primary node waits for every broker to register and creates the topics; once the topics
+  exist, every node starts its harness instance."
   (:require [clojure.string :as str]
             [clojure.tools.logging :refer [info warn]]
             [jepsen [control :as c]
@@ -292,6 +294,9 @@
     (install-harness! test jar-digest)
     (configure! test node)
     (format-storage! test node (cluster-id! cluster-id))
+    ;; A broker that cannot register with the controller quorum within a minute exits, so
+    ;; every broker starts only once every node is installed and formatted.
+    (jepsen/synchronize test setup-barrier-seconds)
     (start-kafka! test node)
     ;; Every broker process is started: the primary waits for them all and creates the topics once.
     (jepsen/synchronize test setup-barrier-seconds)

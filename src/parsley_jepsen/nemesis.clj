@@ -38,6 +38,11 @@
 
 (def refusal-faults (set (map first refusal-targets)))
 
+(def op-f
+  "The :f a fault's op carries where it is not the fault's own name: Jepsen's file
+  corruption nemesis already answers to :truncate."
+  {:truncate :truncate-records})
+
 (defn plan
   "Gives each requested refusal-class fault a process no other fault in the run has:
   [[fault {:process p :topic t ...}] ...] in the order they will be injected. A fault left
@@ -118,7 +123,7 @@
         named (+ 1000000 (client/log-end admin (TopicPartition. names (int partition))))
         uid (str "held-" topic "-" partition)
         tp (TopicPartition. topic (int partition))
-        md (with-open [producer ^KafkaProducer (client/producer test)]
+        md (with-open [producer ^KafkaProducer (client/make-producer test)]
              ^RecordMetadata (.get (.send producer (client/record {:topic topic :partition partition :key uid :uid uid
                                                                    :stamp {[(get ids names) partition] named}}))
                                    30 TimeUnit/SECONDS))
@@ -257,7 +262,7 @@
 
 (def justifies
   "The refusal reasons each fault justifies once injected."
-  {:truncate #{:POSITIONS_DISCARDED_UNREAD}
+  {:truncate-records #{:POSITIONS_DISCARDED_UNREAD}
    :delete-topic #{:CHANNEL_DELETED_WITH_UNDELIVERED_MESSAGES :CHANNEL_IDENTITY_CHANGED}
    :recreate-topic #{:CHANNEL_IDENTITY_CHANGED :CHANNEL_DELETED_WITH_UNDELIVERED_MESSAGES}
    :delete-changelog #{:ORDERING_STATE_LOST}
@@ -271,7 +276,7 @@
   (reify
     nemesis/Reflection
     (fs [_] #{:kill-instance :restart-instance :pause-instance :resume-instance :wipe-restart-instance
-              :restart-dropping :truncate :discard-held-copy :delete-topic :recreate-topic
+              :restart-dropping :truncate-records :discard-held-copy :delete-topic :recreate-topic
               :reset-offsets :delete-changelog :add-partitions})
 
     nemesis/Nemesis
@@ -303,7 +308,7 @@
                                        (fn [t n] (db/kill-harness! t n) (db/wipe-harness-state! t n) (db/start-harness! t n)))
                            {})
 
-                       :truncate (truncate! test v)
+                       :truncate-records (truncate! test v)
                        :discard-held-copy (discard-held-copy! test v)
                        :delete-topic (delete-topic!! test v)
                        :recreate-topic (recreate-topic! test v)
@@ -357,7 +362,7 @@
   [opts planned]
   (let [ops (for [[fault target] planned
                   :when (not= :corrupt fault)]
-              {:type :info :f fault :value (assoc target :partition (rand-int (:partitions opts)))})]
+              {:type :info :f (get op-f fault fault) :value (assoc target :partition (rand-int (:partitions opts)))})]
     (when (seq ops)
       [(gen/sleep (:nemesis-interval opts 60))
        (gen/delay (:nemesis-interval opts 60) ops)])))
@@ -379,7 +384,9 @@
                        {:type :info :f :restart-instance :value {:nodes :all}}]
      :perf #{{:name "instance-kill" :start #{:kill-instance} :stop #{:restart-instance} :color "#E9A4A0"}
              {:name "instance-pause" :start #{:pause-instance} :stop #{:resume-instance} :color "#A0B1E9"}
-             {:name "parsley-fault" :fs (conj refusal-faults :wipe-restart-instance :discard-held-copy :reset-offsets)
+             {:name "parsley-fault" :fs (-> (set (map #(get op-f % %) refusal-faults))
+                                           (disj :corrupt)
+                                           (conj :wipe-restart-instance :discard-held-copy :reset-offsets))
               :color "#C5A0E9"}}}))
 
 (defn package

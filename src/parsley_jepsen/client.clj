@@ -43,7 +43,7 @@
 (def topics db/topics)
 (def processes {"splitter" ["src"] "joiner" ["a" "b" "loop"] "cycler" ["c"] "selfer" ["d" "self"]})
 
-(defn producer ^KafkaProducer [test]
+(defn make-producer ^KafkaProducer [test]
   (let [props (doto (Properties.)
                 (.put ProducerConfig/BOOTSTRAP_SERVERS_CONFIG (db/bootstrap-servers test))
                 (.put ProducerConfig/ACKS_CONFIG "all")
@@ -53,7 +53,7 @@
                 (.put ProducerConfig/MAX_BLOCK_MS_CONFIG "10000"))]
     (KafkaProducer. props (StringSerializer.) (StringSerializer.))))
 
-(def admin db/admin)
+(def make-admin db/admin)
 
 ;; ---- the causes header, encoded by the frozen grammar (wire-format.md) ----
 
@@ -272,7 +272,7 @@
 (defrecord Client [producer admin]
   client/Client
   (open! [this test node]
-    (assoc this :producer (producer test) :admin (admin test)))
+    (assoc this :producer (make-producer test) :admin (make-admin test)))
 
   (setup! [this test])
 

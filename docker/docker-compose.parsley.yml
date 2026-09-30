@@ -1,0 +1,18 @@
+# An override for Jepsen's docker environment (jepsen-io/jepsen at v0.3.9, docker/): mounts
+# this project and the directory holding the harness jar into the control node, and keeps
+# the control node's Maven repository in a volume so Clojars is fetched once.
+#
+#   cd jepsen/docker
+#   PARSLEY_JEPSEN_ROOT=/path/to/parsley-jepsen PARSLEY_TARGET=/path/to/parsley/target \
+#     COMPOSE="-f /path/to/parsley-jepsen/docker/docker-compose.parsley.yml" \
+#     bin/up --dev --daemon -n 3
+services:
+  control:
+    volumes:
+      - ${PARSLEY_JEPSEN_ROOT}:/parsley-jepsen
+      - ${PARSLEY_TARGET}:/parsley-target:ro
+      - parsley-m2:/root/.m2
+
+volumes:
+  parsley-m2:
+    external: true
