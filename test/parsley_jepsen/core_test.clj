@@ -52,7 +52,7 @@
              :justifies #{:CHANNEL_IDENTITY_CHANGED}}}
     {:type :info :process :nemesis :f :restart-dropping :value {:process "joiner" :topic "b" :partition 1}}
     {:type :info :process :nemesis :f :restart-dropping
-     :value {:process "joiner" :topic "b" :partition 1 :held true :trace-ends {"0" 11 "1" 3}
+     :value {:process "joiner" :topic "b" :partition 1 :held true :dropped true :trace-ends {"0" 11 "1" 3}
              :justifies #{:CHANNEL_REMOVED_WITH_HELD_MESSAGES}}}
     {:type :invoke :process 3 :f :send :value {:topic "src" :uid "garbage" :malformed true}}
     {:type :invoke :process 1 :f :reads}
@@ -94,6 +94,17 @@
   (testing "a malformed send is a fault from its invocation, whether or not it was acknowledged"
     (is (= [:UNDECODABLE_METADATA] (:justifies (fault :corrupt))))
     (is (= "splitter" (get-in (fault :corrupt) [:details :expect :process])))))
+
+(deftest a-drop-that-never-restarted-declares-nothing
+  (let [failed (indexed [{:type :info :process :nemesis :f :restart-dropping :value {:process "joiner" :topic "b" :partition 1}}
+                         {:type :info :process :nemesis :f :restart-dropping
+                          :value {:process "joiner" :topic "b" :partition 1 :error "send timed out"
+                                  :justifies #{:CHANNEL_REMOVED_WITH_HELD_MESSAGES}}}
+                         {:type :invoke :process 1 :f :dump}
+                         {:type :ok :process 1 :f :dump :value {:file "dump.edn" :topic-ids ids :records 1 :trace 0}}])
+        export (core/export-from-history {:partitions 2} failed dump)]
+    (is (= [:restart-dropping] (map :kind (:faults export))) "the fault is kept, and justifies its refusal still")
+    (is (empty? (core/missing-refusals export)) "and nothing is expected of it")))
 
 (deftest observations-carry-their-history-index
   (is (= [3] (map :index (:reads export))))

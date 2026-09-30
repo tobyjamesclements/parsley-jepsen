@@ -43,15 +43,20 @@
 (def topics db/topics)
 (def processes {"splitter" ["src"] "joiner" ["a" "b" "loop"] "cycler" ["c"] "selfer" ["d" "self"]})
 
-(defn make-producer ^KafkaProducer [test]
-  (let [props (doto (Properties.)
-                (.put ProducerConfig/BOOTSTRAP_SERVERS_CONFIG (db/bootstrap-servers test))
-                (.put ProducerConfig/ACKS_CONFIG "all")
-                (.put ProducerConfig/ENABLE_IDEMPOTENCE_CONFIG "true")
-                (.put ProducerConfig/REQUEST_TIMEOUT_MS_CONFIG "10000")
-                (.put ProducerConfig/DELIVERY_TIMEOUT_MS_CONFIG "30000")
-                (.put ProducerConfig/MAX_BLOCK_MS_CONFIG "10000"))]
-    (KafkaProducer. props (StringSerializer.) (StringSerializer.))))
+(defn make-producer
+  "An idempotent producer with acks=all. `overrides` replace the timeouts, which are short
+  for the workload's clients and long for a nemesis that must get one record through."
+  (^KafkaProducer [test] (make-producer test {}))
+  (^KafkaProducer [test overrides]
+   (let [props (doto (Properties.)
+                 (.put ProducerConfig/BOOTSTRAP_SERVERS_CONFIG (db/bootstrap-servers test))
+                 (.put ProducerConfig/ACKS_CONFIG "all")
+                 (.put ProducerConfig/ENABLE_IDEMPOTENCE_CONFIG "true")
+                 (.put ProducerConfig/REQUEST_TIMEOUT_MS_CONFIG "10000")
+                 (.put ProducerConfig/DELIVERY_TIMEOUT_MS_CONFIG "30000")
+                 (.put ProducerConfig/MAX_BLOCK_MS_CONFIG "10000"))]
+     (doseq [[k v] overrides] (.put props k v))
+     (KafkaProducer. props (StringSerializer.) (StringSerializer.)))))
 
 (def make-admin db/admin)
 
@@ -208,17 +213,29 @@
 
 (defn lag
   "Lines naming every received partition a running process has not committed reading to
-  the end of. Topics in `gone` no longer exist and are left out."
+  the end of. Topics in `gone` no longer exist, and topics the run has dropped from the
+  declaration are received no more; both are left out."
   [^Admin admin test refused gone]
   (vec (for [[process received] processes
              :when (not (contains? refused process))
-             :let [partitions (for [topic received :when (not (contains? gone topic))
+             :let [dropped (some-> (:dropped-topics test) deref)
+                   partitions (for [topic received :when (not (or (contains? gone topic) (contains? dropped topic)))
                                     p (range (:partitions test))]
                                 (TopicPartition. topic (int p)))
-                   ends (list-offsets admin partitions (OffsetSpec/latest) IsolationLevel/READ_COMMITTED)
+                   ;; A topic that vanished part-way through a fault is left out as well.
+                   ends (try (list-offsets admin partitions (OffsetSpec/latest) IsolationLevel/READ_COMMITTED)
+                             (catch ExecutionException e
+                               (if (instance? org.apache.kafka.common.errors.UnknownTopicOrPartitionException (.getCause e))
+                                 (into {} (for [tp partitions
+                                                :let [end (try (get (list-offsets admin [tp] (OffsetSpec/latest) IsolationLevel/READ_COMMITTED) tp)
+                                                               (catch ExecutionException _ nil))]
+                                                :when end]
+                                            [tp end]))
+                                 (throw e))))
                    positions (committed admin (group-id process))]
              tp partitions
-             :let [end (get ends tp 0) position (get positions tp)]
+             :when (contains? ends tp)
+             :let [end (get ends tp) position (get positions tp)]
              :when (if (nil? position) (pos? end) (< position end))]
          (str process " " tp " committed " position " of " end))))
 

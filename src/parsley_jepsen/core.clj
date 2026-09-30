@@ -129,7 +129,9 @@
                                   :justifies (vec (when (map? v) (:justifies v)))
                                   :trace-ends (or (:trace-ends details) (nearest-ends reads (:index invocation)))
                                   :details details}]
-                       (if (= :restart-dropping (:f completion))
+                       ;; The declaration changed only if the restart happened: a fault that failed
+                       ;; before it says so by carrying no :dropped.
+                       (if (and (= :restart-dropping (:f completion)) (:dropped v))
                          (let [dropped (conj dropped (:topic v))]
                            (recur (rest pairs) dropped
                                   (into (conj faults fault)

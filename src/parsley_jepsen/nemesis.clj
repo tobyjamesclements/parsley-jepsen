@@ -119,9 +119,34 @@
    {:retry-interval 1000 :log-interval 10000 :timeout 120000
     :log-message (str "Waiting for topic " topic " to be deleted")}))
 
-(defn- delete-topic! [^Admin admin ^String topic]
-  (get! (.all (.deleteTopics admin ^java.util.Collection (list topic))))
+(defn- delete-topic!
+  "Deletes the topic and waits until it is gone. The request is retried, since under a
+  network partition it can time out after the deletion has begun, and a topic already
+  gone is fine."
+  [^Admin admin ^String topic]
+  (util/await-fn
+   (fn []
+     (try (get! (.all (.deleteTopics admin ^java.util.Collection (list topic))))
+          (catch ExecutionException e
+            (when-not (instance? org.apache.kafka.common.errors.UnknownTopicOrPartitionException (.getCause e))
+              (throw e)))))
+   {:retry-interval 2000 :log-interval 10000 :timeout 180000
+    :log-message (str "Deleting topic " topic)})
   (await-topic-gone! admin topic))
+
+(defn- recreate!
+  "Creates the topic again and waits until its name resolves to an incarnation other than
+  `old`, retrying the creation, which can time out under a partition too."
+  [test ^Admin admin topic old]
+  (util/await-fn
+   (fn []
+     (db/create-topics! test [topic])
+     (let [new (get (client/describe-ids admin [topic]) topic)]
+       (when (or (nil? new) (= new old))
+         (throw (ex-info "topic not yet recreated" {:topic topic})))
+       new))
+   {:retry-interval 2000 :log-interval 10000 :timeout 180000
+    :log-message (str "Recreating topic " topic)}))
 
 (defn- hold!
   "Manufactures a held message: a record on `topic`'s partition whose stamp names a
@@ -132,10 +157,13 @@
         named (+ 1000000 (client/log-end admin (TopicPartition. names (int partition))))
         uid (str "held-" topic "-" partition)
         tp (TopicPartition. topic (int partition))
-        md (with-open [producer ^KafkaProducer (client/make-producer test)]
+        ;; A partition can stall a send for a while; the record must get through.
+        md (with-open [producer ^KafkaProducer (client/make-producer test {"delivery.timeout.ms" "150000"
+                                                                            "request.timeout.ms" "30000"
+                                                                            "max.block.ms" "60000"})]
              ^RecordMetadata (.get (.send producer (client/record {:topic topic :partition partition :key uid :uid uid
                                                                    :stamp {[(get ids names) partition] named}}))
-                                   30 TimeUnit/SECONDS))
+                                   180 TimeUnit/SECONDS))
         offset (.offset ^RecordMetadata md)
         held (try (util/await-fn
                    (fn []
@@ -210,8 +238,7 @@
         (let [old (get (client/topic-ids test admin) topic)
               ends (trace-high-watermarks test admin)]
           (delete-topic! admin topic)
-          (db/create-topics! test [topic])
-          (let [new (get (client/describe-ids admin [topic]) topic)]
+          (let [new (recreate! test admin topic old)]
             {:old old :new new :reinitialised-ends ends
              :expect {:process process :refusal :CHANNEL_IDENTITY_CHANGED}}))))
     (finally (start-all! test))))
@@ -267,7 +294,7 @@
     (try
       (let [ends (with-admin test (fn [^Admin admin] (trace-high-watermarks test admin)))]
         (swap! (:dropped-topics test) conj topic)
-        (cond-> (assoc held :trace-ends ends)
+        (cond-> (assoc held :trace-ends ends :dropped true)
           (:held held) (assoc :expect {:process process :refusal :CHANNEL_REMOVED_WITH_HELD_MESSAGES})))
       (finally (start-all! test)))))
 
