@@ -376,16 +376,18 @@
 (defn- expression-bound
   "Everything the task could have seen expressed by the time of `entry`: what it had
   delivered, every position it could have received on a channel it ever received, and every
-  position the records there name. Nil when retention has discarded records the task may
-  have received and the export does not hold them, since what they named is gone with
-  them; the simulator's export keeps every record its retention discarded."
+  position the records there name. Nil when records the task may have received are gone
+  from the export, since what they named is gone with them: retention discarded them and
+  the export does not hold them (the simulator's keeps every record its retention
+  discarded), or their topic was deleted and nothing of it could be dumped."
   [m task entry delivered-positions]
   (reduce (fn [bound channel]
             (let [records (get-in m [:records-by-channel channel])
                   spans (merged-spans (received-spans-up-to m task channel entry))
                   log-start (log-start m channel)]
-              (if (and (pos? log-start) (seq spans) (< (ffirst spans) log-start)
-                       (empty? (when records (subseq records < log-start))))
+              (if (or (and (dead? m channel) (nil? records) (seq spans))
+                      (and (pos? log-start) (seq spans) (< (ffirst spans) log-start)
+                           (empty? (when records (subseq records < log-start)))))
                 (reduced nil)
                 (reduce (fn [bound [from to]]
                           (reduce (fn [bound [_ r]]

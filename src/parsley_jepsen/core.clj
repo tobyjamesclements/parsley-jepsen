@@ -107,7 +107,10 @@
         statuses (vec (for [op history :when (and (ok? op) (= :status (:f op)))
                             [process s] (:processes (:value op))]
                         {:index (:index op) :time (:time op) :process process
-                         :lifecycle (:lifecycle s) :refusal (:refusal s) :detail (:detail s)
+                         :lifecycle (:lifecycle s) :refusal (:refusal s)
+                         ;; A start that failed before any process ran names no process; its
+                         ;; reason is the detail of each.
+                         :detail (or (:detail s) (:start-failure (:value op)))
                          :trace-ends (nearest-ends reads (:index op))}))
         injected (loop [pairs (nemesis-faults history) dropped #{} faults []]
                    (if-let [[invocation completion] (first pairs)]
@@ -207,9 +210,13 @@
                 {:keys [valid? violations]} (pchecker/check export)
                 missing (missing-refusals export)
                 oracle (java-oracle test path)
-                quiesced? (boolean (some #(and (= :ok (:type %)) (= :quiesce (:f %))) history))]
-            {:valid? (and valid? (empty? missing) (not (false? (:clean? oracle))))
+                quiesce (last (filter #(and (= :quiesce (:f %)) (not= :invoke (:type %))) history))
+                quiesced? (= :ok (:type quiesce))]
+            ;; Liveness is judged at quiescence, and a run that never got there (the lag below
+            ;; never drained) is not valid whatever the trace says.
+            {:valid? (and valid? quiesced? (empty? missing) (not (false? (:clean? oracle))))
              :quiesced? quiesced?
+             :lag-at-end (when-not quiesced? (:lag (:value quiesce)))
              :violation-count (count violations)
              :violations (vec (take 200 violations))
              :stale-reads (count (:stale-reads export))

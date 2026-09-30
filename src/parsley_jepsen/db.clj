@@ -209,9 +209,12 @@
 
 (defn start-harness!
   "Starts the instance on this node, declaring everything but the topics the run has
-  dropped so far (the test map's :dropped-topics)."
+  dropped so far (the test map's :dropped-topics). The harness truncates its log file when
+  it starts, so what an earlier instance logged is kept in the .history file first."
   [test node]
   (c/su
+   (when (cu/exists? harness-log)
+     (c/exec :bash :-c (str "cat " harness-log " >> " harness-log ".history && rm -f " harness-log)))
    (apply cu/start-daemon! {:logfile harness-stdout
                             :pidfile harness-pid
                             :chdir harness-dir
@@ -311,11 +314,11 @@
   (teardown! [_ test node]
     (kill-harness! test node)
     (kill-kafka! test node)
-    (c/su (c/exec :rm :-rf data-dir harness-state harness-log harness-stdout (str kafka-dir "/logs"))))
+    (c/su (c/exec :rm :-rf data-dir harness-state harness-log (str harness-log ".history") harness-stdout (str kafka-dir "/logs"))))
 
   db/LogFiles
   (log-files [_ test node]
-    [kafka-log harness-log harness-stdout])
+    [kafka-log harness-log (str harness-log ".history") harness-stdout])
 
   db/Kill
   (start! [_ test node] (start-kafka! test node))
