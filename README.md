@@ -7,9 +7,9 @@ lifetime of a process. Where the guarantee cannot be upheld, a process stops rat
 it.
 
 The plan below is the contract for what gets built, and the code follows it. Criteria are cited
-as in Parsley's `SPEC.md`: "Safety 1", "Structural 15", "Host obligation 6". The first three
-items of the build order are in place and verified; the rest is drafted and unverified, as
-[Build order](#build-order) says.
+as in Parsley's `SPEC.md`: "Safety 1", "Structural 15", "Host obligation 6". The first four
+items of the build order are in place and verified; [Build order](#build-order) says what each
+verification covered and what it did not.
 
 ## Why a Jepsen test
 
@@ -178,7 +178,15 @@ nothing ever delivers.
   real two-instance run against the embedded broker (`cluster-honest.edn`) passes. Over 120
   seeds per mode, the export replay catches most of what the simulator's own oracle catches;
   `index.edn` records the figures. The gap is receipt the observations do not cover, which the
-  simulator's oracle sees exactly. The live inversion on a cluster is not yet done.
+  simulator's oracle sees exactly.
+
+  Done on the cluster (`--calibrate inversion`): while nothing else sends, H goes to `a`'s
+  partition 0 with an out-of-contract stamp naming `b`'s log end there, so the joiner holds
+  it; E then goes to that position of `b` with no header, though its producer had observed H
+  and the history records that it had. The joiner delivers E at once, which settles H's
+  stamp, and H after it. Both checkers flag the run: Safety 1 at delivery time and over the
+  delivered pair, and Structural 15 on every downstream send that could not express the cause
+  the stamper hid.
 
 ## Out of scope
 
@@ -225,10 +233,14 @@ node alongside the broker. On Parsley's side the pieces are `JepsenTopology`,
       process and the replay accepts the justified refusal.
 - [x] The Clojure decoder, against the codec vectors.
 - [x] The checker, and its calibration against simulator exports.
-- [ ] The KRaft DB adapter, developed on Jepsen's docker nodes. `db.clj`, `client.clj`,
-      `workload.clj`, `nemesis.clj` and `core.clj` are drafted to the design but have never
-      been compiled or run: they were written where Clojars, and so Jepsen, was unreachable.
-      Expect them to need work on first contact with real nodes.
+- [x] The KRaft DB adapter, developed on Jepsen's docker nodes (jepsen-io/jepsen v0.3.9,
+      `docker/`, three Debian bookworm nodes on one 8 GB Docker VM, brokers and instances at
+      512 MB heaps). Verified: Kafka 4.3.1, `--time-limit 120 --nemesis none` ends with the
+      `:parsley` checker `:valid? true` over 7318 trace entries and as many records, quiesced,
+      and Parsley's own Oracle replay clean over the same export; `--calibrate inversion` is
+      flagged by both. Not verified: Kafka 3.7.0, more than three nodes, and runs longer than
+      two minutes. The checker's replay is still quadratic in a task's steps (22 seconds for
+      this run, 280 before the receipt spans were merged), which a long run will feel.
 - [ ] Nemeses in order of expected yield: instance pause and kill, partitions during commit,
       retention and record deletion, topic delete and recreate, offset reset, changelog
       deletion, clock skew.
@@ -255,10 +267,31 @@ java -cp "lib/*:src:test" clojure.main -e \
    (clojure.test/run-tests 'parsley-jepsen.wire-test 'parsley-jepsen.checker-test)"
 ```
 
-The cluster test itself does not run yet. The planned entry point follows Jepsen convention,
-with the harness jar built from Parsley beside it:
+The cluster test follows Jepsen convention, with the harness jar built from Parsley beside
+it. On Jepsen's docker nodes (jepsen-io/jepsen at v0.3.9, whose `docker/` directory later
+releases dropped), `docker/docker-compose.parsley.yml` mounts this project and the jar into
+the control node:
 
 ```
-lein run test --nodes-file nodes.txt --kafka-version 4.3.1 --time-limit 3600 \
-    --nemesis partition,pause,kill,truncate --nemesis-interval 60
+cd jepsen/docker
+PARSLEY_JEPSEN_ROOT=/path/to/parsley-jepsen PARSLEY_TARGET=/path/to/parsley/target \
+  COMPOSE="-f /path/to/parsley-jepsen/docker/docker-compose.parsley.yml" bin/up --dev --daemon -n 3
+docker exec -it jepsen-control bash
+cd /parsley-jepsen
+lein run test --nodes-file ~/nodes --kafka-version 4.3.1 --time-limit 120 --nemesis none \
+    --harness-jar /parsley-target/parsley-0.4.0-SNAPSHOT-jepsen-harness.jar \
+    --kafka-heap 512m --harness-heap 512m
+lein run test --nodes-file ~/nodes --kafka-version 4.3.1 --time-limit 3600 \
+    --nemesis partition,instance-pause,instance-kill,truncate --nemesis-interval 60 ...
 ```
+
+`--nemesis` takes `none` or any of `partition`, `kill`, `pause`, `clock` (Jepsen's, over the
+brokers), `instance-kill`, `instance-pause`, `wipe`, `discard-held-copy`, `reset-offsets`,
+and the refusal-class faults `truncate`, `delete-topic`, `recreate-topic`, `delete-changelog`,
+`add-partitions`, `restart-dropping`, `corrupt`, of which a run schedules at most one per
+process. Every run writes `dump.edn` (the harness export) and `export.edn` (what the checker
+judged) beside its history under `store/`, and the `:parsley` result carries the Clojure
+checker's violations, Parsley's Oracle verdict over the same file, and any expected refusal
+that never came. The control node on an arm64 machine needs the control image's JDK URL
+changed from `linux-x64` to `linux-aarch64`. The first run on fresh nodes downloads Kafka
+from archive.apache.org, which is slow; later runs use the nodes' cache.
