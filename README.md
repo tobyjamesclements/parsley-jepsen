@@ -142,6 +142,68 @@ process, or performs the runbook's reset afterwards. Rebalances and transaction 
 to tens of seconds, so the nemesis interval must let the cluster recover between faults or
 nothing ever delivers.
 
+How each row was made to happen on the cluster, and what came of it (Kafka 4.3.1, three
+docker nodes, one fault per run at `--rate 2` unless said otherwise):
+
+- **Delete records past a lagging task's committed position** (`truncate`): every instance
+  is killed, external producers keep sending to `src`, the records just past the splitter's
+  committed position on one partition are deleted, and the instances restart.
+  `POSITIONS_DISCARDED_UNREAD` came, and the rest of the run judges valid.
+- **Retention discards a held message's copy** (`discard-held-copy`): records up to a task's
+  committed position are deleted while it runs. No refusal, and the run judges valid; what
+  the discarded records named is gone with them, so a task that received them has no
+  expression bound and the two checks that need one are not made for its sends.
+- **Delete a received topic while messages are held from it** (`delete-topic`): a record on
+  `self` stamped with a position far past `d`'s log end is sent, the selfer is seen to read
+  it, and `self` is deleted while the selfer runs. **The refusal did not come.** Kafka Streams
+  stopped the selfer itself, on every instance, with "One or more source topics were missing
+  during rebalance", before any task initialisation at which Parsley's identity check would
+  have found the topic gone; and every later start refused with "declared topics could not be
+  resolved", which is a prerequisite failure, not a refusal. The run reports the missing
+  refusal and does not quiesce. On a real cluster, the host reaches this condition first.
+- **Delete and recreate a received topic while the process is down** (`recreate-topic`):
+  every instance is killed, `c` is deleted and created again, the trace's high watermarks are
+  read while all are down, and the instances restart. `CHANNEL_IDENTITY_CHANGED` came at the
+  cycler's start, and the run judges valid; nothing of the old incarnation can be dumped, so
+  the cycler's sends have no expression bound either.
+- **Reset the group's offsets backwards while the process is down** (`reset-offsets`): the
+  instances are stopped with SIGTERM, since Kafka Streams does not leave its group on close
+  and altering offsets needs the group empty, the offsets are moved back by one to five, and
+  the instances restart. No refusal; the checker sets the rewound observations aside and the
+  run judges valid.
+- **Delete the ordering changelog, keeping the group's offsets** (`delete-changelog`): every
+  instance is killed, the changelog topic is deleted, every instance's local state is wiped,
+  and the instances restart. `ORDERING_STATE_LOST` came.
+- **Add partitions to the widest received topic, then restart** (`add-partitions`): `a`
+  grows from three partitions to four while every instance is down. `TASK_WIDTH_CHANGED` came
+  at the joiner.
+- **Restart with a declaration dropping a topic that holds messages** (`restart-dropping`):
+  a held record is manufactured on `self` as above, every instance is killed, the trace's
+  high watermarks are read, and the instances restart with `--drop-topic self`.
+  `CHANNEL_REMOVED_WITH_HELD_MESSAGES` came at the selfer.
+- **Malformed `parsley.causes` header** (`corrupt`): one record with a header of version 99
+  goes to `src` a minute in. `UNDECODABLE_METADATA` came at the splitter.
+- **Stamp naming the log-end offset**: a tenth of the workload's sends. Never refused. A
+  held stamp's position travels in the holder's frontier, which Structural 12 allows, and
+  the checkers judge it against the log end, markers and aborted records included.
+- **Partition, broker kill, pause, clock skew**: partitions (`partition`, one node, a
+  majority, a ring) and instance kills and pauses (`instance-kill`, `instance-pause`, each
+  lasting about an interval, past the transaction timeout) produced no refusal and judge
+  valid; a partition cut a group coordinator off and it kept answering from its stale
+  cache, which is why every observation is now the freshest of every broker's view. Broker
+  kill and pause (`kill`, `pause`) are wired but were not run. `clock` runs (bumps, strobes,
+  a reset) and judges valid, but on docker nodes the clock is the VM's, shared by every node
+  and the control node, so it is a jump for the whole cluster rather than skew between
+  nodes, and the VM's clock wants an `ntpdate` afterwards.
+- **Mixed**: `--nemesis partition,instance-kill,instance-pause,truncate,recreate-topic,delete-changelog,restart-dropping
+  --time-limit 600`, four times. The first three found what a fault does when it lands
+  inside a partition (a deletion whose request timed out with the deletion under way, a
+  hold whose send timed out though the record got through), and the nemesis now retries
+  those to completion. The fourth judges valid in both checkers, quiesced, with all four
+  refusals the table expects: splitter `POSITIONS_DISCARDED_UNREAD`, joiner
+  `ORDERING_STATE_LOST`, cycler `CHANNEL_IDENTITY_CHANGED`, selfer
+  `CHANNEL_REMOVED_WITH_HELD_MESSAGES`.
+
 ## The checker
 
 - **Happened-before** comes from the trace and the topology, not from headers. A record sent by
@@ -157,7 +219,19 @@ nothing ever delivers.
   received before it. That gives a lower bound on receipt, which extends the causal past with
   the causes of received messages, and an upper bound, which bounds what a send may express.
   Both brackets hold with several tasks sharing a trace partition and with a fenced zombie's
-  open transaction, which a last-stable-offset bracket on the far side would not.
+  open transaction, which a last-stable-offset bracket on the far side would not. An
+  observation is only a bound if it is current: a group coordinator or partition leader cut
+  off by a partition keeps answering from a stale cache, so the client takes each observation
+  as the freshest of every broker's view, and the checker sets aside any observation that
+  reports a position or a trace end below an earlier one, unless a `reset-offsets` fault
+  between them says what it rewound.
+- **What the export cannot hold** is not judged against. Where retention discarded records a
+  task may have received, or its received topic was deleted, what those records named is gone
+  with them, so nothing bounds what the task could have seen expressed, and the
+  over-expression and Structural 12 checks are not made for its sends. Structural 12 is
+  judged against each partition's log end, which counts the offsets transaction markers and
+  aborted records took, and a position learned from the metadata of a received message is
+  allowed whether or not it is assigned, as the spec says.
 - **The export** is one EDN map: the declaration, topic identities with log starts and
   liveness, every task's received channels, every committed record with its raw
   `parsley.causes` header, the trace, the read observations, the status history, the faults
@@ -241,10 +315,20 @@ node alongside the broker. On Parsley's side the pieces are `JepsenTopology`,
       flagged by both. Not verified: Kafka 3.7.0, more than three nodes, and runs longer than
       two minutes. The checker's replay is still quadratic in a task's steps (22 seconds for
       this run, 280 before the receipt spans were merged), which a long run will feel.
-- [ ] Nemeses in order of expected yield: instance pause and kill, partitions during commit,
+- [x] Nemeses in order of expected yield: instance pause and kill, partitions during commit,
       retention and record deletion, topic delete and recreate, offset reset, changelog
-      deletion, clock skew.
+      deletion, clock skew. Each ran on its own for three to five minutes, at most once per
+      process, and [Nemeses](#nemeses) says what came of each. Ten of the table's eleven rows
+      came out as the table says; topic deletion did not, and the run says so. Not verified:
+      broker kill and pause, clock skew as skew rather than a cluster-wide jump, Kafka 3.7.0,
+      and combinations beyond the ten-minute mixed run.
 - [ ] Long mixed runs on both broker versions. A separate, labelled unclean-election run.
+      The checkers stand in the way first: both keep every record's causes as a set, so the
+      replay is quadratic in a run's length (the Clojure checker takes 22 seconds over a
+      two-minute run at `--rate 5` and 318 over five minutes; Parsley's replay exhausts a 3 GB
+      heap past about 20,000 records), which is why the runs above are short and at
+      `--rate 2`. A frontier per channel in place of the sets is the change that would let
+      an hour's run be judged.
 
 ## Reference code
 
