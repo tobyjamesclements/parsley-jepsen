@@ -56,6 +56,39 @@
     :else (let [r (wire/decode-hex causes)]
             (if (:undecodable r) :undecodable (:causes r)))))
 
+(defn stale-reads
+  "Splits the read observations into the fresh and the stale. Committed positions and trace
+  ends only grow, so an observation that reports a position or a trace end below what an
+  earlier one reported was answered from a stale cache, as a group coordinator or a
+  partition leader cut off by a network partition keeps answering, and it would place a
+  step's receipts before positions committed after it. A `reset-offsets` fault, whose
+  details name what it `rewound`, lowers what a task's later observations must reach. Only
+  a cluster's observations are judged so: the simulated host rewinds a process's positions
+  as a fault of its own, and its observations are exact."
+  [source reads faults]
+  (if (not= :cluster source)
+    {:fresh reads :stale []}
+  (let [rewinds (for [f faults :when (get-in f [:details :rewound])]
+                  {:index (:index f) :rewound (get-in f [:details :rewound])
+                   :task-name (task-name (get-in f [:details :process]) (get-in f [:details :partition]))})
+        events (sort-by :index (concat (map #(assoc % :event :read) reads) (map #(assoc % :event :rewind) rewinds)))]
+    (loop [events events floors {} ends {} fresh [] stale []]
+      (if-let [e (first events)]
+        (case (:event e)
+          :rewind (recur (rest events)
+                         (update floors (:task-name e) #(merge-with min % (:rewound e)))
+                         ends fresh stale)
+          :read (let [floor (get floors (:task-name e) {})
+                      below? (or (some (fn [[channel position]] (< position (get floor channel -1))) (:next-read e))
+                                 (some (fn [[tp end]] (< end (get ends tp -1))) (:ends-hi e)))]
+                  (if below?
+                    (recur (rest events) floors ends fresh (conj stale e))
+                    (recur (rest events)
+                           (assoc floors (:task-name e) (merge-with max floor (:next-read e)))
+                           (merge-with max ends (:ends-hi e))
+                           (conj fresh e) stale))))
+        {:fresh (map #(dissoc % :event) fresh) :stale (map #(dissoc % :event) stale)})))))
+
 (defn- build
   "Indexes the export once: topics, records, trace, observations, declarations."
   [export]
@@ -79,11 +112,13 @@
         producer-by-effect (reduce (fn [m e] (reduce (fn [m [_ uid]] (if (contains? m uid) m (assoc m uid e)))
                                                      m (:effects e)))
                                    {} (mapcat val trace-by-task))
-        reads-by-task (->> (:reads export)
-                           (map #(assoc % :task-name (task-name (:process %) (:task %))))
+        faults (sort-by :index (:faults export))
+        {fresh-reads :fresh stale :stale} (stale-reads (:source export)
+                                                       (map #(assoc % :task-name (task-name (:process %) (:task %))) (:reads export))
+                                                       faults)
+        reads-by-task (->> fresh-reads
                            (sort-by :index)
                            (group-by :task-name))
-        faults (sort-by :index (:faults export))
         declarations-by-task (->> faults
                                   (filter #(= :declared (:kind %)))
                                   (group-by #(task-name (get-in % [:details :process])
@@ -117,6 +152,7 @@
      :trace-by-task trace-by-task
      :producer-by-effect producer-by-effect
      :reads-by-task reads-by-task
+     :stale-reads (vec stale)
      :faults faults
      :declarations-by-task declarations-by-task
      :starts-by-task starts-by-task
@@ -661,7 +697,8 @@
     (distinct (concat declared (keys (:trace-by-task m))))))
 
 (defn check
-  "Judges one export. Returns {:valid? boolean :violations [strings]}."
+  "Judges one export. Returns {:valid? boolean :violations [strings] :stale-reads n}, the
+  last being the observations set aside as answered from a stale cache."
   [export]
   (let [m (build export)
         tasks (all-tasks m)
@@ -678,7 +715,8 @@
                     (recreations m))
         violations (vec violations)]
     {:valid? (empty? violations)
-     :violations violations}))
+     :violations violations
+     :stale-reads (count (:stale-reads m))}))
 
 (defn check-file
   "Judges the export at `path`."

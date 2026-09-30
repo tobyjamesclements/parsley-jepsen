@@ -90,7 +90,9 @@
   with its history index; every :status result per process; every nemesis op, malformed
   send and out-of-contract stamp as a fault with the refusals it justifies. A topic
   deletion is a `kill`, a recreation a `recreate`, and a restart under a narrower
-  declaration a `declared` fault per task, which is how the checker spells them."
+  declaration a `declared` fault per task, which is how the checker spells them. Read
+  observations answered from a stale cache (parsley-jepsen.checker/stale-reads) go under
+  :stale-reads, where no checker reads them."
   [test history dump]
   (let [ok? #(= :ok (:type %))
         invoke? #(= :invoke (:type %))
@@ -111,6 +113,9 @@
                    (if-let [[invocation completion] (first pairs)]
                      (let [v (:value completion)
                            details (if (map? v) (dissoc v :justifies) {:value (pr-str v)})
+                           details (if (and (= :reset-offsets (:f completion)) (:to v))
+                                     (assoc details :rewound {[(get ids (:topic v)) (:partition v)] (:to v)})
+                                     details)
                            fault {:index (:index invocation) :time (:time invocation)
                                   :kind (case (:f completion)
                                           :delete-topic :kill
@@ -145,13 +150,18 @@
                                 [(:uid (:value op)) (:stamped-from (:value op))]))
         tasks (vec (mapcat #(task-receives ids partitions % #{}) (keys client/processes)))
         starts (vec (for [{:keys [process task receives]} tasks]
-                      {:process process :task task :positions (into {} (map (fn [ch] [ch 0]) receives))}))]
+                      {:process process :task task :positions (into {} (map (fn [ch] [ch 0]) receives))}))
+        faults (vec (sort-by :index (concat injected corrupt out-of-contract)))
+        ;; An observation answered from a stale cache is set aside before either checker
+        ;; sees it, so both judge the same observations.
+        {fresh :fresh stale :stale} (pchecker/stale-reads :cluster (map #(assoc % :task-name (pchecker/task-name (:process %) (:task %))) reads) faults)]
     (-> dump
         (update :topics #(vec (concat % dead)))
         (update :records (fn [records] (mapv (fn [r] (if-let [from (get stamped-from (:uid r))] (assoc r :stamped-from from) r)) records)))
-        (assoc :reads reads
+        (assoc :reads (mapv #(dissoc % :task-name) fresh)
+               :stale-reads (mapv #(dissoc % :task-name) stale)
                :statuses statuses
-               :faults (vec (sort-by :index (concat injected corrupt out-of-contract)))
+               :faults faults
                :tasks tasks
                :start-positions starts))))
 
@@ -202,6 +212,7 @@
              :quiesced? quiesced?
              :violation-count (count violations)
              :violations (vec (take 200 violations))
+             :stale-reads (count (:stale-reads export))
              :missing-refusals missing
              :java-oracle oracle
              :refusals (vec (distinct (for [s (:statuses export) :when (:refusal s)] [(:process s) (:refusal s)])))

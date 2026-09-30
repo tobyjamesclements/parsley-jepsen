@@ -32,7 +32,7 @@
   (:import [java.net HttpURLConnection URL]
            [java.util Properties]
            [java.util.concurrent ExecutionException TimeUnit]
-           [org.apache.kafka.clients.admin Admin ListOffsetsOptions OffsetSpec]
+           [org.apache.kafka.clients.admin Admin AdminClientConfig ListOffsetsOptions OffsetSpec]
            [org.apache.kafka.clients.producer KafkaProducer ProducerConfig ProducerRecord RecordMetadata]
            [org.apache.kafka.common IsolationLevel TopicPartition]
            [org.apache.kafka.common.errors GroupIdNotFoundException]
@@ -54,6 +54,18 @@
     (KafkaProducer. props (StringSerializer.) (StringSerializer.))))
 
 (def make-admin db/admin)
+
+(defn make-views
+  "One admin client per broker, bootstrapped from that broker alone, so an observation
+  can ask every broker's view. Short timeouts: a broker cut off by a partition answers
+  slowly or not at all, and its view is then simply missing."
+  [test]
+  (mapv (fn [node]
+          (Admin/create ^java.util.Map
+                        {AdminClientConfig/BOOTSTRAP_SERVERS_CONFIG (str node ":9092")
+                         AdminClientConfig/REQUEST_TIMEOUT_MS_CONFIG "4000"
+                         AdminClientConfig/DEFAULT_API_TIMEOUT_MS_CONFIG "6000"}))
+        (:nodes test)))
 
 ;; ---- the causes header, encoded by the frozen grammar (wire-format.md) ----
 
@@ -164,15 +176,25 @@
 (defn group-id [process]
   (str db/app-prefix "-" process))
 
+(defn- freshest
+  "The freshest of several brokers' views of values that only grow: their maximum per key.
+  A broker cut off by a partition keeps answering from a stale cache, as a deposed group
+  coordinator or partition leader, and an observation taken from it alone would place a
+  step's receipts before positions that were committed after it. Every broker is asked and
+  a view that fails is left out."
+  [f views]
+  (apply merge-with max {} (keep (fn [^Admin view] (try (f view) (catch Exception _ nil))) views)))
+
 (defn observe-reads
   "One observation per task: the last stable offsets of the trace before the group offsets,
-  the high watermarks after, as JepsenExport records them. The order is what makes both
-  bounds on receipt sound; do not collapse it to one read."
-  [^Admin admin test ids]
+  the high watermarks after, as JepsenExport records them, each the freshest of every
+  broker's view. The order is what makes both bounds on receipt sound; do not collapse it
+  to one read."
+  [views test ids]
   (let [n (:partitions test)
-        lo (trace-ends admin n IsolationLevel/READ_COMMITTED)
-        by-process (into {} (for [p (keys processes)] [p (committed admin (group-id p))]))
-        hi (trace-ends admin n IsolationLevel/READ_UNCOMMITTED)]
+        lo (freshest #(trace-ends % n IsolationLevel/READ_COMMITTED) views)
+        by-process (into {} (for [p (keys processes)] [p (freshest #(committed % (group-id p)) views)]))
+        hi (freshest #(trace-ends % n IsolationLevel/READ_UNCOMMITTED) views)]
     (vec (for [[process offsets] by-process
                [task next-read] (->> offsets
                                      (group-by (fn [[^TopicPartition tp _]] (.partition tp)))
@@ -269,10 +291,10 @@
 (defn- error [^Throwable e]
   (str (.getName (class e)) ": " (.getMessage e)))
 
-(defrecord Client [producer admin]
+(defrecord Client [producer admin views]
   client/Client
   (open! [this test node]
-    (assoc this :producer (make-producer test) :admin (make-admin test)))
+    (assoc this :producer (make-producer test) :admin (make-admin test) :views (make-views test)))
 
   (setup! [this test])
 
@@ -284,7 +306,7 @@
       (try
         (case (:f op)
           :status (assoc op :type :ok :value (assoc (status (:value op)) :node (:value op)))
-          :reads (assoc op :type :ok :value (observe-reads admin test (topic-ids test admin)))
+          :reads (assoc op :type :ok :value (observe-reads views test (topic-ids test admin)))
           :quiesce (quiesce test admin op)
           :dump (assoc op :type :ok :value (dump test admin)))
         (catch Exception e
@@ -294,7 +316,9 @@
 
   (close! [this test]
     (.close ^KafkaProducer producer (java.time.Duration/ofSeconds 5))
-    (.close ^Admin admin (java.time.Duration/ofSeconds 5))))
+    (.close ^Admin admin (java.time.Duration/ofSeconds 5))
+    (doseq [^Admin view views]
+      (.close view (java.time.Duration/ofSeconds 5)))))
 
 (defn client [opts]
   (map->Client {}))

@@ -3,6 +3,7 @@
   that keeps refusal-class faults to one per process, over constructed histories: no
   cluster is involved."
   (:require [clojure.test :refer [deftest is testing]]
+            [parsley-jepsen.checker :as checker]
             [parsley-jepsen.core :as core]
             [parsley-jepsen.nemesis :as nemesis]))
 
@@ -54,6 +55,9 @@
      :value {:process "joiner" :topic "b" :partition 1 :held true :trace-ends {"0" 11 "1" 3}
              :justifies #{:CHANNEL_REMOVED_WITH_HELD_MESSAGES}}}
     {:type :invoke :process 3 :f :send :value {:topic "src" :uid "garbage" :malformed true}}
+    {:type :invoke :process 1 :f :reads}
+    {:type :ok :process 1 :f :reads
+     :value [{:process "cycler" :task 0 :ends-lo {"0" 12} :ends-hi {"0" 12} :next-read {[(ids "c") 0] 4} :exec-start {}}]}
     {:type :invoke :process 1 :f :dump}
     {:type :ok :process 1 :f :dump :value {:file "dump.edn" :topic-ids ids :records 1 :trace 0}}]))
 
@@ -93,6 +97,8 @@
 
 (deftest observations-carry-their-history-index
   (is (= [3] (map :index (:reads export))))
+  (is (= [16] (map :index (:stale-reads export)))
+      "an observation reporting a position below an earlier one was answered from a stale cache")
   (is (= #{["selfer" :CHANNEL_DELETED_WITH_UNDELIVERED_MESSAGES] ["cycler" nil]}
          (set (map (juxt :process :refusal) (:statuses export)))))
   (is (= {"0" 4} (:trace-ends (first (:statuses export)))) "a status is placed by the last read before it"))
@@ -122,3 +128,17 @@
       (is (apply distinct? (map (comp :process second) planned)))))
   (testing "faults that justify no refusal are not planned"
     (is (empty? (nemesis/plan #{:partition :instance-kill :reset-offsets})))))
+
+(deftest a-rewind-fault-lowers-what-later-observations-must-reach
+  (let [reads [{:index 1 :task-name "joiner-0" :next-read {["a" 0] 10} :ends-hi {"0" 5}}
+               {:index 3 :task-name "joiner-0" :next-read {["a" 0] 7} :ends-hi {"0" 6}}
+               {:index 5 :task-name "joiner-0" :next-read {["a" 0] 8} :ends-hi {"0" 4}}
+               {:index 6 :task-name "joiner-1" :next-read {["a" 1] 2} :ends-hi {"0" 7}}]
+        faults [{:index 2 :kind :reset-offsets :details {:process "joiner" :partition 0 :rewound {["a" 0] 7}}}]]
+    (testing "the observation after the rewind is fresh, and one whose trace ends fall is stale"
+      (is (= [1 3 6] (map :index (:fresh (checker/stale-reads :cluster reads faults)))))
+      (is (= [5] (map :index (:stale (checker/stale-reads :cluster reads faults))))))
+    (testing "without the rewind fault the lower observation is stale"
+      (is (= [1 6] (map :index (:fresh (checker/stale-reads :cluster reads []))))))
+    (testing "a simulator's observations are exact and never set aside"
+      (is (= 4 (count (:fresh (checker/stale-reads :simulator reads []))))))))
