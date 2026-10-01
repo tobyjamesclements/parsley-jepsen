@@ -193,14 +193,16 @@
                                                                    :stamp {[(get ids names) partition] named}}))
                                    180 TimeUnit/SECONDS))
         offset (.offset ^RecordMetadata md)
-        held (try (util/await-fn
-                   (fn []
-                     (when-not (some-> (committed admin process tp) (> offset))
-                       (throw (ex-info "not yet read" {})))
-                     true)
-                   {:retry-interval 1000 :log-interval 10000 :timeout 60000
-                    :log-message (str "Waiting for " process " to read the held record at " tp "@" offset)})
-                  (catch Exception _ false))]
+        held (try (with-views test
+                    (fn [views]
+                      (util/await-fn
+                       (fn []
+                         (when-not (some-> (committed views process tp) (> offset))
+                           (throw (ex-info "not yet read" {})))
+                         true)
+                       {:retry-interval 1000 :log-interval 10000 :timeout 60000
+                        :log-message (str "Waiting for " process " to read the held record at " tp "@" offset)})))
+                  (catch Exception e (warn "The held record was not seen read:" (.getMessage e)) false))]
     {:held held :held-at offset :held-uid uid :named [(get ids names) partition named]}))
 
 ;; ---- the faults ----
@@ -244,16 +246,22 @@
           {:to position :channel [topic partition]})))))
 
 (defn- delete-topic!!
-  "Delete a received topic while a message is held from it."
+  "Delete a received topic while a message is held from it, then restart every instance.
+  The host stops the process first on a live deletion, with its own reason and no
+  refusal; the refusal is made at the next start, from the ordering state, so the restart
+  is part of the fault."
   [test {:keys [process topic] :as v}]
-  (with-admin test
-    (fn [^Admin admin]
-      (let [id (get (client/topic-ids test admin) topic)
-            held (hold! test admin v)]
-        (swap! (:gone-topics test) conj topic)
-        (delete-topic! admin topic)
-        (cond-> (assoc held :channel [id 0])
-          (:held held) (assoc :expect {:process process :refusal :CHANNEL_DELETED_WITH_UNDELIVERED_MESSAGES}))))))
+  (let [result (with-admin test
+                 (fn [^Admin admin]
+                   (let [id (get (client/topic-ids test admin) topic)
+                         held (hold! test admin v)]
+                     (swap! (:gone-topics test) conj topic)
+                     (delete-topic! admin topic)
+                     (assoc held :channel [id 0]))))]
+    (kill-all! test)
+    (start-all! test)
+    (cond-> result
+      (:held result) (assoc :expect {:process process :refusal :CHANNEL_DELETED_WITH_UNDELIVERED_MESSAGES}))))
 
 (defn- recreate-topic!
   "Delete and recreate a received topic under the same name while every instance is down:

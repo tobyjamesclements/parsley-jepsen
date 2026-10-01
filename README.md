@@ -156,12 +156,14 @@ docker nodes, one fault per run at `--rate 2` unless said otherwise):
   expression bound and the two checks that need one are not made for its sends.
 - **Delete a received topic while messages are held from it** (`delete-topic`): a record on
   `self` stamped with a position far past `d`'s log end is sent, the selfer is seen to read
-  it, and `self` is deleted while the selfer runs. **The refusal did not come.** Kafka Streams
-  stopped the selfer itself, on every instance, with "One or more source topics were missing
-  during rebalance", before any task initialisation at which Parsley's identity check would
-  have found the topic gone; and every later start refused with "declared topics could not be
-  resolved", which is a prerequisite failure, not a refusal. The run reports the missing
-  refusal and does not quiesce. On a real cluster, the host reaches this condition first.
+  it, `self` is deleted while the selfer runs, and every instance is restarted. On the live
+  deletion Kafka Streams stops the selfer first, on every instance, with "One or more source
+  topics were missing during rebalance", before any task initialisation at which Parsley's
+  identity check would have found the topic gone; as first found, every later start then
+  refused with "declared topics could not be resolved", a prerequisite failure, and the
+  refusal never came. Parsley now makes the diagnosis at the next start, from its ordering
+  state: `CHANNEL_DELETED_WITH_UNDELIVERED_MESSAGES` came at the selfer, naming the topic
+  and the channels still holding messages from it, and the run judges valid.
 - **Delete and recreate a received topic while the process is down** (`recreate-topic`):
   every instance is killed, `c` is deleted and created again, the trace's high watermarks are
   read while all are down, and the instances restart. `CHANNEL_IDENTITY_CHANGED` came at the
@@ -353,9 +355,10 @@ node alongside the broker. On Parsley's side the pieces are `JepsenTopology`,
 - [x] Nemeses in order of expected yield: instance pause and kill, partitions during commit,
       retention and record deletion, topic delete and recreate, offset reset, changelog
       deletion, clock skew. Each ran on its own for three to five minutes, at most once per
-      process, and [Nemeses](#nemeses) says what came of each. Ten of the table's eleven rows
-      came out as the table says; topic deletion did not, and the run says so. Not verified:
-      clock skew as skew rather than a cluster-wide jump.
+      process, and [Nemeses](#nemeses) says what came of each. Every row of the table came
+      out as the table says, topic deletion once Parsley made its diagnosis at the next
+      start rather than leaving it to the host. Not verified: clock skew as skew rather
+      than a cluster-wide jump.
 - [x] Long mixed runs on both broker versions. A separate, labelled unclean-election run.
       An hour on each version under the non-refusal faults (valid on 4.3.1; one
       nemesis-made refusal on 3.7.0, explained under [Nemeses](#nemeses)), ten minutes with
