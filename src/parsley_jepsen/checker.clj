@@ -18,6 +18,12 @@
   effects each step declared, Assumption 2, and Operational 1 and 6: every refusal follows an
   injected fault that justifies it.
 
+  A causal past is a frontier, the greatest position per channel, standing for every
+  position up to it; under FIFO delivery (Safety 3, judged on its own) that is the past
+  exactly, and it is what lets a long trace be judged. Receipt spans and what received
+  records name are kept per observation prefix and per channel prefix, found by binary
+  search.
+
   Ordering never relies on a clock. Every trace entry carries its trace partition `tp` and
   offset `to`; every observation carries the trace ends it saw. A read observation records
   the ends twice: `ends-lo` was read before the group's positions, `ends-hi` after, so its
@@ -101,6 +107,16 @@
         records-by-channel (reduce (fn [m r] (update m (:channel r) (fnil assoc (sorted-map)) (:offset r) r))
                                    {} records)
         records-by-pos (into {} (map (fn [r] [(:pos r) r]) records))
+        ;; Per channel, in offset order, what the records up to each one could have let a
+        ;; receiver see expressed: the offset itself and every position its metadata names.
+        ;; A receipt span that starts at the channel's first record is answered from here
+        ;; by one lookup instead of a walk of the span.
+        named-by-channel (into {} (for [[channel by-offset] records-by-channel]
+                                    [channel {:offsets (vec (keys by-offset))
+                                              :bounds (vec (rest (reductions (fn [bound r]
+                                                                              (let [bound (assoc bound channel (:offset r))]
+                                                                                (if (map? (:meta r)) (merge-with max bound (:meta r)) bound)))
+                                                                            {} (vals by-offset))))}]))
         records-by-uid (group-by :uid records)
         trace (->> (:trace export)
                    (map (fn [e] (assoc e :task-name (task-name (:process e) (:task e))
@@ -154,6 +170,7 @@
      :by-name by-name
      :records-by-channel records-by-channel
      :records-by-pos records-by-pos
+     :named-by-channel named-by-channel
      :records-by-uid records-by-uid
      :trace-by-task trace-by-task
      :producer-by-effect producer-by-effect
@@ -248,49 +265,14 @@
 
 ;; ---- receipt, from the read observations ----
 
-(defn- execution-start [m task reads channel]
-  (or (get-in reads [:exec-start channel])
-      (get-in m [:starts-by-task task channel])
-      0))
-
-(defn- received-spans-before
-  "Spans [from to) of positions on `channel` the task is known to have received before
-  `entry`: for every observation taken before the step, from where its execution began
-  reading the channel to the position it committed."
-  [m task channel entry]
-  (for [reads (get-in m [:reads-by-task task])
-        :let [end (get-in reads [:ends-hi (:tp entry)])
-              next (get-in reads [:next-read channel])
-              from (execution-start m task reads channel)]
-        :when (and end (<= end (:to entry)) next (> next from))]
-    [from next]))
-
-(defn- received-spans-ever [m task channel]
-  (for [reads (get-in m [:reads-by-task task])
-        :let [next (get-in reads [:next-read channel])
-              from (execution-start m task reads channel)]
-        :when (and next (> next from))]
-    [from next]))
-
-(defn- received-spans-up-to
-  "Spans of positions on `channel` the task could have received before `entry`: the spans
-  of every observation before the step and the span of the first observation after it,
-  whose positions cover the step's own receipts; everything when no observation follows.
-  Over-approximates receipt, and survives a rewind."
-  [m task channel entry]
-  (let [before (received-spans-before m task channel entry)
-        after (->> (get-in m [:reads-by-task task])
-                   (filter (fn [reads] (when-let [end (get-in reads [:ends-lo (:tp entry)])] (> end (:to entry)))))
-                   (sort-by :index)
-                   first)]
-    (if (nil? after)
-      (conj (vec before) [0 Long/MAX_VALUE])
-      (let [next (get-in after [:next-read channel])
-            from (execution-start m task after channel)]
-        (if (and next (> next from)) (conj (vec before) [from next]) (vec before))))))
-
-(defn- in-span? [[from to] position]
-  (and (>= position from) (< position to)))
+(defn- count-at-or-below
+  "How many of the ascending `offsets` are at or below `offset`."
+  [offsets offset]
+  (loop [lo 0 hi (count offsets)]
+    (if (< lo hi)
+      (let [mid (quot (+ lo hi) 2)]
+        (if (<= (nth offsets mid) offset) (recur (inc mid) hi) (recur lo mid)))
+      lo)))
 
 (defn- merged-spans
   "The union of spans as disjoint spans in ascending order. Every observation of a task
@@ -306,13 +288,108 @@
           []
           (sort spans)))
 
-;; ---- ground truth: true causes ----
+
+(defn- execution-start [m task reads channel]
+  (or (get-in reads [:exec-start channel])
+      (get-in m [:starts-by-task task channel])
+      0))
+
+(defn- read-span
+  "The span [from next) of positions on `channel` one observation shows the task received,
+  or nil."
+  [m task reads channel]
+  (let [next (get-in reads [:next-read channel])
+        from (execution-start m task reads channel)]
+    (when (and next (> next from)) [from next])))
+
+;; The observations of a task are kept in index order, and the trace ends they carry only
+;; grow along it (a cluster's stale observations are set aside first, and the simulator's
+;; trace ends are counts), so the observations taken before a step are a prefix of them.
+;; Each prefix's receipt spans are merged once and then found by one binary search, which
+;; keeps a task's replay linear in its observations rather than quadratic.
+
+(defn- ends-vector
+  "Each observation's end for trace partition `tp`, in index order; an observation that
+  carries no end for it had seen nothing of it, which is 0."
+  [m task key tp]
+  (let [memo (:memo m)]
+    (or (get-in @memo [:ends task key tp])
+        (let [v (mapv #(get-in % [key tp] 0) (get-in m [:reads-by-task task]))
+              v (if (= v (vec (sort v))) v ::unordered)]
+          (swap! memo assoc-in [:ends task key tp] v)
+          v))))
+
+(defn- prefix-spans
+  "For each k, the merged spans of the first k observations' receipts on `channel`."
+  [m task channel]
+  (let [memo (:memo m)]
+    (or (get-in @memo [:prefix-spans task channel])
+        (let [spans (map #(read-span m task % channel) (get-in m [:reads-by-task task]))
+              v (vec (reductions (fn [merged span] (if span (merged-spans (conj merged span)) merged)) [] spans))]
+          (swap! memo assoc-in [:prefix-spans task channel] v)
+          v))))
+
+(defn- received-spans-before
+  "Spans [from to) of positions on `channel` the task is known to have received before
+  `entry`: for every observation taken before the step, from where its execution began
+  reading the channel to the position it committed. Merged."
+  [m task channel entry]
+  (let [ends (ends-vector m task :ends-hi (:tp entry))]
+    (if (= ::unordered ends)
+      (merged-spans (for [reads (get-in m [:reads-by-task task])
+                          :let [end (get-in reads [:ends-hi (:tp entry)])
+                                span (read-span m task reads channel)]
+                          :when (and end (<= end (:to entry)) span)]
+                      span))
+      (nth (prefix-spans m task channel) (count-at-or-below ends (:to entry))))))
+
+(defn- received-spans-ever [m task channel]
+  (peek (prefix-spans m task channel)))
+
+(defn- received-spans-up-to
+  "Spans of positions on `channel` the task could have received before `entry`: the spans
+  of every observation before the step and the span of the first observation after it,
+  whose positions cover the step's own receipts; everything when no observation follows.
+  Over-approximates receipt, and survives a rewind."
+  [m task channel entry]
+  (let [before (received-spans-before m task channel entry)
+        reads (get-in m [:reads-by-task task])
+        ends (ends-vector m task :ends-lo (:tp entry))
+        after (if (= ::unordered ends)
+                (->> reads
+                     (filter (fn [reads] (when-let [end (get-in reads [:ends-lo (:tp entry)])] (> end (:to entry)))))
+                     first)
+                (let [k (count-at-or-below ends (:to entry))]
+                  (when (< k (count reads)) (nth reads k))))]
+    (if (nil? after)
+      (conj (vec before) [0 Long/MAX_VALUE])
+      (if-let [span (read-span m task after channel)]
+        (conj (vec before) span)
+        (vec before)))))
+
+(defn- in-span? [[from to] position]
+  (and (>= position from) (< position to)))
+
+;; ---- ground truth: true causes, as frontiers ----
+
+;; A causal past is a frontier: for each channel, the greatest position in it, standing
+;; for every position on that channel up to it. The set of positions it stands for is the
+;; true past only where a task delivers each channel in position order (Safety 3), which
+;; is judged on its own: under FIFO a position is delivered exactly when every record
+;; before it on its channel is, so "every cause delivered" is "the greatest cause on each
+;; channel delivered", and "every cause expressed" is "the greatest expressed". A frontier
+;; is a map of a few channels where a set was a copy of the run so far, which is what lets
+;; an hour's trace be judged.
+
+(defn- frontier-merge
+  ([] {})
+  ([a b] (merge-with max a b)))
 
 (declare past-after)
 
 (defn- true-causes
-  "The true causes of the record at `pos` (a set of positions): the record an external
-  stamper observed and its causes, or the producing task's past once its step delivered."
+  "The true causes of the record at `pos`, as a frontier: the record an external stamper
+  observed and its causes, or the producing task's past once its step delivered."
   [m pos uid-hint]
   (let [memo (:memo m)]
     (if-let [known (get-in @memo [:causes pos])]
@@ -321,22 +398,21 @@
             uid (or (:uid rec) uid-hint)
             causes (cond
                      (:stamped-from rec)
-                     (let [from (:stamped-from rec)]
+                     (let [[id partition offset :as from] (:stamped-from rec)]
                        (if (record-at m from)
-                         (conj (true-causes m from nil) from)
-                         #{}))
+                         (frontier-merge (true-causes m from nil) {[id partition] offset})
+                         {}))
                      :else
                      (if-let [producer (and uid (get-in m [:producer-by-effect uid]))]
                        (past-after m producer)
-                       #{}))]
+                       {}))]
         (swap! memo assoc-in [:causes pos] causes)
         causes))))
 
 (defn- past-after
   "The producing task's causal past once its step `entry` had delivered: every earlier
   delivery and its causes, the causes of every record known received before the step, and
-  the delivery itself with its causes. Snapshots per step share structure, so keeping every
-  one is cheap."
+  the delivery itself with its causes. One frontier per step."
   [m entry]
   (let [task (:task-name entry)
         step (:step entry)
@@ -348,7 +424,7 @@
           (nth snapshots step)
           (let [next (count snapshots)
                 delivered (nth entries next)
-                previous (if (zero? next) #{} (peek snapshots))
+                previous (if (zero? next) {} (peek snapshots))
                 merged (get-in @memo [:merged task] {})
                 [received-causes merged]
                 (reduce (fn [[acc merged] channel]
@@ -360,12 +436,14 @@
                                                 [offset r] (subseq records >= from < to)
                                                 :when (not (contains? done offset))]
                                             r)
-                                    acc (reduce (fn [acc r] (into acc (true-causes m (:pos r) (:uid r)))) acc fresh)]
+                                    acc (reduce (fn [acc r] (frontier-merge acc (true-causes m (:pos r) (:uid r)))) acc fresh)]
                                 [acc (assoc merged channel (into done (map :offset fresh)))]))))
                         [previous merged]
                         (received-ever m task))
-                causes (true-causes m (:pos delivered) (:uid delivered))
-                past (-> received-causes (conj (:pos delivered)) (into causes))]
+                [id partition offset] (:pos delivered)
+                past (-> received-causes
+                         (frontier-merge {[id partition] offset})
+                         (frontier-merge (true-causes m (:pos delivered) (:uid delivered))))]
             (swap! memo (fn [state] (-> state
                                         (assoc-in [:past task] (conj (get-in state [:past task] []) past))
                                         (assoc-in [:merged task] merged))))
@@ -390,14 +468,18 @@
                            (empty? (when records (subseq records < log-start)))))
                 (reduced nil)
                 (reduce (fn [bound [from to]]
-                          (reduce (fn [bound [_ r]]
-                                    (let [bound (update bound channel (fnil max -1) (:offset r))]
-                                      (if (map? (:meta r))
-                                        (reduce (fn [bound [named position]] (update bound named (fnil max -1) position))
-                                                bound (:meta r))
-                                        bound)))
-                                  bound
-                                  (when records (subseq records >= from < to))))
+                          (let [{:keys [offsets bounds]} (get-in m [:named-by-channel channel])]
+                            (if (and offsets (<= from (first offsets)))
+                              (let [n (count-at-or-below offsets (dec to))]
+                                (if (pos? n) (merge-with max bound (nth bounds (dec n))) bound))
+                              (reduce (fn [bound [_ r]]
+                                        (let [bound (update bound channel (fnil max -1) (:offset r))]
+                                          (if (map? (:meta r))
+                                            (reduce (fn [bound [named position]] (update bound named (fnil max -1) position))
+                                                    bound (:meta r))
+                                            bound)))
+                                      bound
+                                      (when records (subseq records >= from < to))))))
                         bound
                         spans))))
           (reduce (fn [bound [id partition offset]] (update bound [id partition] (fnil max -1) offset)) {} delivered-positions)
@@ -424,25 +506,25 @@
 ;; ---- the replay ----
 
 (defn- settled-now
-  "The causes of the delivered message settled by evidence at this moment: on a channel the
-  task does not receive, below its start position, or on a dead channel it is not known to
-  have received them from. A cause the task had received is never settled by its channel's
-  death (Safety 9)."
+  "The channels of the delivered message's causes settled by evidence at this moment: a
+  channel the task does not receive, one whose cause lies below the start position, or a
+  dead channel the task is not known to have received the cause from. A cause the task had
+  received is never settled by its channel's death (Safety 9)."
   [m task entry received causes max-delivered]
   (let [start (get-in m [:starts-by-task task] {})]
-    (set (filter (fn [[id partition offset :as cause]]
-                   (let [channel [id partition]]
-                     (or (not (contains? received channel))
+    (set (for [[channel offset] causes
+               :when (or (not (contains? received channel))
                          (< offset (get start channel 0))
                          (and (dead? m channel)
                               (not (or (some-> (get max-delivered channel) (> offset))
-                                       (some #(in-span? % offset) (received-spans-before m task channel entry))))))))
-                 causes))))
+                                       (some #(in-span? % offset) (received-spans-before m task channel entry))))))]
+           channel))))
 
 (defn- check-expression
   "The expression checks on one send: Structural 14 and 12, over-expression, Structural 15.
-  With `upper` nil, what the sender could have seen expressed is unknown, and the two checks
-  that need it are not made."
+  `past` is the sender's causal past as a frontier and `excused` the channels in it that no
+  longer exist. With `upper` nil, what the sender could have seen expressed is unknown, and
+  the two checks that need it are not made."
   [m sent-pos meta past upper excused]
   (if (= :undecodable meta)
     [(str "Trace: the frontier expressed by " (pos-str sent-pos) " is undecodable")]
@@ -467,11 +549,11 @@
                :when (or (nil? bound) (> position bound))]
            (str "Over-expression: " (pos-str sent-pos) " expresses " (channel-str channel) "@" position
                 " above anything its sender had delivered or seen expressed at send time (bound: " bound ")")))
-       (for [[id partition offset :as cause] past
-             :when (not (contains? excused cause))
-             :let [expressed (get meta [id partition])]
+       (for [[channel offset] past
+             :when (not (contains? excused channel))
+             :let [expressed (get meta channel)]
              :when (or (nil? expressed) (< expressed offset))]
-         (str "Structural 15: " (pos-str sent-pos) " fails to express cause " (pos-str cause)
+         (str "Structural 15: " (pos-str sent-pos) " fails to express cause " (pos-str (conj channel offset))
               " (expressed: " expressed ")"))))))
 
 (defn- trace-pos [m entry]
@@ -517,13 +599,14 @@
                   (not (contains? received channel))
                   (conj (str "Declaration: " task " delivered " (:uid entry) " (" (pos-str pos)
                              ") from a channel it does not receive")))
-              v (into v (for [[id partition offset :as cause] causes
-                              :when (not (contains? delivered-set cause))
-                              :when (not (contains? settled cause))
-                              :let [bound (get engine-past [id partition] Long/MIN_VALUE)]
+              ;; Everything delivered lies within the engine's past, so a cause not within it was
+              ;; not delivered either.
+              v (into v (for [[channel offset] causes
+                              :when (not (contains? settled channel))
+                              :let [bound (get engine-past channel Long/MIN_VALUE)]
                               :when (> offset bound)]
                           (str "Safety 1 (delivery-time): " task " delivered " (:uid entry) " (" (pos-str pos)
-                               ") while its cause " (pos-str cause)
+                               ") while its cause " (pos-str (conj channel offset))
                                " was neither delivered, nor settled by evidence, nor within the delivered past")))
               delivered-set (conj delivered-set pos)
               delivered (conj delivered pos)
@@ -534,7 +617,7 @@
               max-delivered (update max-delivered channel (fnil max -1) (:offset entry))
               upper (expression-bound m task entry delivered)
               past (past-after m entry)
-              excused (set (filter (fn [[id partition _]] (dead? m [id partition])) past))
+              excused (set (filter #(dead? m %) (keys past)))
               v (into v (check-expression m (trace-pos m entry) (:meta entry) past upper excused))
               v (reduce (fn [v [topic uid]]
                           (let [matches (filter #(= (topic-name m (:topic %)) topic) (get-in m [:records-by-uid uid]))]
@@ -578,12 +661,26 @@
                                         (str "Safety 3: " task " delivered " (pos-str pos) " after position "
                                              previous " of the same channel"))))))
                       {:last {} :violations []} delivered))
+        ;; Per channel, positions in order with the latest first-delivery index among those
+        ;; up to each: a frontier's cause on that channel was delivered after the effect
+        ;; exactly when that index is past the effect's.
+        latest-by-channel (into {} (for [[channel positions] (group-by (fn [[[id partition _] _]] [id partition]) first-index)]
+                                     [channel (let [sorted (sort-by (fn [[[_ _ offset] _]] offset) positions)]
+                                                {:offsets (mapv (fn [[[_ _ offset] _]] offset) sorted)
+                                                 :latest (vec (rest (reductions (fn [latest [_ i]] (max latest i)) -1 sorted)))})]))
+        latest-up-to (fn [channel offset]
+                       (when-let [{:keys [offsets latest]} (get latest-by-channel channel)]
+                         (let [n (count-at-or-below offsets offset)]
+                           (when (pos? n)
+                             (let [i (nth latest (dec n))]
+                               ;; The position delivered at that index is only looked up for a violation.
+                               [(delay (first (filter #(= i (get first-index (conj channel %))) (take n offsets)))) i])))))
         pairs (for [[i effect] (map-indexed vector delivered)
-                    cause (true-causes m effect nil)
-                    :let [cause-index (get first-index cause)]
+                    [channel offset] (true-causes m effect nil)
+                    :let [[cause-offset cause-index] (latest-up-to channel offset)]
                     :when (and cause-index (> cause-index i))]
                 (str "Safety 1: " task " delivered effect " (pos-str effect) " (index " i
-                     ") before its cause " (pos-str cause) " (index " cause-index ")"))]
+                     ") before its cause " (pos-str (conj channel @cause-offset)) " (index " cause-index ")"))]
     (concat dupes fifo pairs)))
 
 (defn- held-by-unsettled-stamp? [m rec received start exempt owed-by-channel]

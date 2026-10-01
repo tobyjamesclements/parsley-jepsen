@@ -225,6 +225,15 @@ docker nodes, one fault per run at `--rate 2` unless said otherwise):
   as the freshest of every broker's view, and the checker sets aside any observation that
   reports a position or a trace end below an earlier one, unless a `reset-offsets` fault
   between them says what it rewound.
+- **A causal past is a frontier**: for each channel, the greatest position in it, standing
+  for every position on that channel up to it. That is the true past only where a task
+  delivers each channel in position order (Safety 3), which is judged on its own: under FIFO
+  a position is delivered exactly when every record before it on its channel is, so "every
+  cause delivered" is "the greatest cause on each channel delivered", and "every cause
+  expressed" is "the greatest expressed". Receipt spans and what received records name are
+  kept per observation prefix and per channel prefix, found by binary search. Both checkers
+  judge every stored export exactly as the set-based ones did, in seconds (a five-minute
+  run's 17,404 entries: 318 seconds before, 5 after in Clojure, 1 in Java).
 - **What the export cannot hold** is not judged against. Where retention discarded records a
   task may have received, or its received topic was deleted, what those records named is gone
   with them, so nothing bounds what the task could have seen expressed, and the
@@ -313,8 +322,7 @@ node alongside the broker. On Parsley's side the pieces are `JepsenTopology`,
       `:parsley` checker `:valid? true` over 7318 trace entries and as many records, quiesced,
       and Parsley's own Oracle replay clean over the same export; `--calibrate inversion` is
       flagged by both. Not verified: Kafka 3.7.0, more than three nodes, and runs longer than
-      two minutes. The checker's replay is still quadratic in a task's steps (22 seconds for
-      this run, 280 before the receipt spans were merged), which a long run will feel.
+      two minutes.
 - [x] Nemeses in order of expected yield: instance pause and kill, partitions during commit,
       retention and record deletion, topic delete and recreate, offset reset, changelog
       deletion, clock skew. Each ran on its own for three to five minutes, at most once per
@@ -323,12 +331,9 @@ node alongside the broker. On Parsley's side the pieces are `JepsenTopology`,
       broker kill and pause, clock skew as skew rather than a cluster-wide jump, Kafka 3.7.0,
       and combinations beyond the ten-minute mixed run.
 - [ ] Long mixed runs on both broker versions. A separate, labelled unclean-election run.
-      The checkers stand in the way first: both keep every record's causes as a set, so the
-      replay is quadratic in a run's length (the Clojure checker takes 22 seconds over a
-      two-minute run at `--rate 5` and 318 over five minutes; Parsley's replay exhausts a 3 GB
-      heap past about 20,000 records), which is why the runs above are short and at
-      `--rate 2`. A frontier per channel in place of the sets is the change that would let
-      an hour's run be judged.
+      The checkers no longer stand in the way: with pasts as frontiers both judge a
+      five-minute run in seconds where the set-based replay took five minutes or ran out of
+      heap, so the runs above being short and at `--rate 2` is history, not a limit.
 
 ## Reference code
 
