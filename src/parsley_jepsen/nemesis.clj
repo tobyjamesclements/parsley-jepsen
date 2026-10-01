@@ -83,14 +83,42 @@
 (defn- nodes-of [test value]
   (if (= :all (:nodes value)) (:nodes test) [(:node value)]))
 
-(defn- committed [^Admin admin process ^TopicPartition tp]
-  (get (client/committed admin (client/group-id process)) tp))
+(defn- with-views
+  "Calls f with one admin client per broker, so a fault can ask every broker's view. A
+  broker cut off by a partition keeps answering from a stale cache, and a fault that acts
+  on one broker's answer can do what no fault meant to: a committed position read high
+  from a coordinator that missed a reset, and records deleted up to it, leave the group
+  below the log start."
+  [test f]
+  (let [views (client/make-views test)]
+    (try (f views)
+         (finally (doseq [^Admin view views] (.close view (java.time.Duration/ofSeconds 5)))))))
 
-(defn- stable-end [^Admin admin ^TopicPartition tp]
-  (get (client/list-offsets admin [tp] (OffsetSpec/latest) IsolationLevel/READ_COMMITTED) tp))
+(defn- view-each
+  "f over every view that answers, or nil when none does."
+  [views f]
+  (seq (keep (fn [^Admin view] (try (f view) (catch Exception _ nil))) views)))
 
-(defn- log-start [^Admin admin ^TopicPartition tp]
-  (get (client/list-offsets admin [tp] (OffsetSpec/earliest) IsolationLevel/READ_COMMITTED) tp))
+(defn- committed
+  "The group's committed position on tp, the lowest of every broker's view: a coordinator
+  that missed a reset answers high, and a fault that deletes or rewinds must not act on
+  that."
+  [views process ^TopicPartition tp]
+  (some->> (view-each views #(get (client/committed % (client/group-id process)) tp))
+           (remove nil?) seq (apply min)))
+
+(defn- stable-end
+  "The partition's last stable offset, the highest of every broker's view."
+  [views ^TopicPartition tp]
+  (some->> (view-each views #(get (client/list-offsets % [tp] (OffsetSpec/latest) IsolationLevel/READ_COMMITTED) tp))
+           (remove nil?) seq (apply max)))
+
+(defn- log-start
+  "The partition's log start, the highest of every broker's view: a deposed leader answers
+  low, and a rewind to below the true log start is a fault no row of the table injects."
+  [views ^TopicPartition tp]
+  (some->> (view-each views #(get (client/list-offsets % [tp] (OffsetSpec/earliest) IsolationLevel/READ_COMMITTED) tp))
+           (remove nil?) seq (apply max)))
 
 (defn- trace-high-watermarks
   "The trace's high watermarks. Read while every instance is down, they are a boundary: a
@@ -185,19 +213,19 @@
   (let [tp (TopicPartition. topic (int partition))]
     (kill-all! test)
     (try
-      (with-admin test
-        (fn [^Admin admin]
-          (let [position (or (committed admin process tp) 0)
+      (with-views test
+        (fn [views]
+          (let [position (or (committed views process tp) 0)
                 end (try (util/await-fn
-                          (fn [] (let [end (stable-end admin tp)]
+                          (fn [] (let [end (stable-end views tp)]
                                    (when (< end (+ position 2)) (throw (ex-info "no lag yet" {})))
                                    end))
                           {:retry-interval 1000 :log-interval 10000 :timeout 45000
                            :log-message (str "Waiting for " tp " to grow past " process "'s committed position")})
-                         (catch Exception _ (stable-end admin tp)))
+                         (catch Exception _ (stable-end views tp)))
                 to (min end (+ position 1 (rand-int 3)))]
             (when (> to position)
-              (get! (.all (.deleteRecords admin {tp (RecordsToDelete/beforeOffset to)}))))
+              (with-admin test (fn [^Admin admin] (get! (.all (.deleteRecords admin {tp (RecordsToDelete/beforeOffset to)}))))))
             (cond-> {:committed position :to to :end end :channel [topic partition]}
               (> to position) (assoc :expect {:process process :refusal :POSITIONS_DISCARDED_UNREAD})))))
       (finally (start-all! test)))))
@@ -208,11 +236,11 @@
   refusal: the hold delivers from the ordering changelog in order."
   [test {:keys [process topic partition]}]
   (let [tp (TopicPartition. topic (int partition))]
-    (with-admin test
-      (fn [^Admin admin]
-        (let [position (or (committed admin process tp) 0)]
+    (with-views test
+      (fn [views]
+        (let [position (or (committed views process tp) 0)]
           (when (pos? position)
-            (get! (.all (.deleteRecords admin {tp (RecordsToDelete/beforeOffset position)}))))
+            (with-admin test (fn [^Admin admin] (get! (.all (.deleteRecords admin {tp (RecordsToDelete/beforeOffset position)}))))))
           {:to position :channel [topic partition]})))))
 
 (defn- delete-topic!!
@@ -253,13 +281,24 @@
         group (client/group-id process)]
     (stop-all! test)
     (try
-      (with-admin test
-        (fn [^Admin admin]
-          (await-group-empty! admin group)
-          (let [position (or (committed admin process tp) 0)
-                target (max (log-start admin tp) (- position back))]
+      (with-views test
+        (fn [views]
+          (with-admin test (fn [^Admin admin] (await-group-empty! admin group)))
+          (let [position (or (committed views process tp) 0)
+                target (max (log-start views tp) (- position back))]
             (when (< target position)
-              (get! (.all (.alterConsumerGroupOffsets admin group {tp (OffsetAndMetadata. target)}))))
+              ;; An alter whose request times out can still be applied later, after the next
+              ;; fault has read the old position and acted on it; so the alter is confirmed by
+              ;; reading the position back, and repeated until it is.
+              (util/await-fn
+               (fn []
+                 (with-admin test (fn [^Admin admin]
+                                    (try (get! (.all (.alterConsumerGroupOffsets admin group {tp (OffsetAndMetadata. target)})))
+                                         (catch Exception e (info "alter not confirmed:" (.getMessage e))))))
+                 (when (not= target (committed views process tp))
+                   (throw (ex-info "offsets not yet altered" {:group group :target target}))))
+               {:retry-interval 2000 :log-interval 10000 :timeout 120000
+                :log-message (str "Altering " group "'s offsets on " tp " to " target)}))
             {:from position :to target :channel [topic partition]})))
       (finally (start-all! test)))))
 
