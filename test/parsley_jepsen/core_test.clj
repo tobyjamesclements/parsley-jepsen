@@ -153,3 +153,51 @@
       (is (= [1 6] (map :index (:fresh (checker/stale-reads :cluster reads []))))))
     (testing "a simulator's observations are exact and never set aside"
       (is (= 4 (count (:fresh (checker/stale-reads :simulator reads []))))))))
+
+(deftest a-reset-starts-the-process-next-lifetime
+  (let [a-id (ids "a") b-id (ids "b") loop-id (ids "loop")
+        history (indexed
+                 [{:type :invoke :process 1 :f :reads}
+                  {:type :ok :process 1 :f :reads
+                   :value [{:process "joiner" :task 0 :ends-lo {"0" 3} :ends-hi {"0" 4} :next-read {[a-id 0] 5} :exec-start {}}]}
+                  {:type :invoke :process 2 :f :status :value "n1"}
+                  {:type :ok :process 2 :f :status
+                   :value {:node "n1" :healthy false :processes {"joiner" {:lifecycle :STOPPED :refusal :ORDERING_STATE_LOST :detail "lost"}}}}
+                  {:type :info :process :nemesis :f :reset-process :value {:process "joiner" :initial :earliest}}
+                  ;; Observed while the reset was under way: the bootstrap's positions under
+                  ;; the old name, which belong to neither lifetime.
+                  {:type :invoke :process 1 :f :reads}
+                  {:type :ok :process 1 :f :reads
+                   :value [{:process "joiner" :task 0 :ends-lo {"0" 9} :ends-hi {"0" 9} :next-read {[a-id 0] 0} :exec-start {}}]}
+                  {:type :invoke :process 2 :f :status :value "n1"}
+                  {:type :ok :process 2 :f :status
+                   :value {:node "n1" :healthy true :processes {"joiner" {:lifecycle :RUNNING :refusal nil :detail nil}}}}
+                  {:type :info :process :nemesis :f :reset-process
+                   :value {:process "joiner" :initial :earliest :incarnation 2 :refusal :ORDERING_STATE_LOST
+                           :trace-ends {"0" 9 "1" 2} :recreated [] :topic-ids ids
+                           :start-positions {[a-id 0] 7 [b-id 0] 2 [loop-id 0] 0 [a-id 1] 8 [b-id 1] 3 [loop-id 1] 1}
+                           :expect-running "joiner#2" :justifies #{}}}
+                  {:type :invoke :process 1 :f :reads}
+                  {:type :ok :process 1 :f :reads
+                   :value [{:process "joiner" :task 0 :ends-lo {"0" 12} :ends-hi {"0" 12} :next-read {[a-id 0] 7} :exec-start {}}]}
+                  {:type :invoke :process 2 :f :status :value "n1"}
+                  {:type :ok :process 2 :f :status
+                   :value {:node "n1" :healthy true :processes {"joiner" {:lifecycle :RUNNING :refusal nil :detail nil}}}}
+                  {:type :invoke :process 1 :f :dump}
+                  {:type :ok :process 1 :f :dump :value {:file "dump.edn" :topic-ids ids :records 1 :trace 0}}])
+        export (core/export-from-history {:partitions 2} history dump)]
+    (testing "observations and statuses after the reset belong to the next lifetime, and those under it to neither"
+      (is (= ["joiner" "joiner#2"] (map :process (:reads export))))
+      (is (= [5 7] (map #(get (:next-read %) [a-id 0]) (:reads export))))
+      (is (= [["joiner" :ORDERING_STATE_LOST] ["joiner#2" nil]] (map (juxt :process :refusal) (:statuses export)))))
+    (testing "the lifetime has its own tasks, start positions and declaration"
+      (let [task (first (filter #(and (= "joiner#2" (:process %)) (= 0 (:task %))) (:tasks export)))
+            start (first (filter #(and (= "joiner#2" (:process %)) (= 0 (:task %))) (:start-positions export)))]
+        (is (= [[a-id 0] [b-id 0] [loop-id 0]] (sort (:receives task))))
+        (is (= {[a-id 0] 7 [b-id 0] 2 [loop-id 0] 0} (:positions start)))
+        (is (= (get-in export [:processes "joiner"]) (get-in export [:processes "joiner#2"])))))
+    (testing "the reset expects the lifetime to run, and it did"
+      (is (empty? (core/missing-refusals export))))
+    (testing "a reset no later status shows running is reported"
+      (is (some #(re-find #"Expected lifetime missing" %)
+                (core/missing-refusals (assoc export :statuses (take 1 (:statuses export)))))))))

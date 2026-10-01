@@ -793,7 +793,9 @@
   "SPEC Assumption 2. In the simulator every receiver re-initialises at the recreation, so
   a step committed afterwards while the dead incarnation is still received is a step on the
   wrong log. On a cluster the host re-creates the task only later, so the judgement starts
-  at the re-initialisation the fault records, if it records one."
+  at the re-initialisation the fault records, if it records one, and falls on the tasks
+  attached to the dead incarnation: a lifetime an operator's reset started afterwards
+  attached to the new one, which is the recovery the runbook prescribes."
   [m]
   (if (= :simulator (get-in m [:export :source]))
     (let [flagged (atom #{})]
@@ -809,11 +811,14 @@
     (for [f (:faults m)
           :when (= :recreate (:kind f))
           :let [ends (get-in f [:details :reinitialised-ends])
-                topic (get-in f [:details :topic])]
+                topic (get-in f [:details :topic])
+                old (get-in f [:details :old])]
           :when (and ends topic)
           [task entries] (:trace-by-task m)
           :let [decl (get-in m [:export :processes (process-of task)])]
-          :when (some #{topic} (:receives decl))
+          :when (if old
+                  (contains? (received-ever m task) [old (partition-of task)])
+                  (some #{topic} (:receives decl)))
           :let [after (first (filter (fn [e] (let [end (get ends (:tp e))] (and end (>= (:to e) end)))) entries))]
           :when after]
       (str "Assumption 2: " task " delivered " (:uid after) " after its received topic " topic

@@ -17,7 +17,8 @@
                             [db :as db]
                             [workload :refer [after]]])
   (:import [java.util.concurrent ExecutionException TimeUnit]
-           [org.apache.kafka.clients.admin Admin NewPartitions OffsetSpec RecordsToDelete]
+           [org.apache.kafka.clients.admin Admin AlterConfigOp AlterConfigOp$OpType ConfigEntry NewPartitions OffsetSpec RecordsToDelete]
+           [org.apache.kafka.common.config ConfigResource ConfigResource$Type]
            [org.apache.kafka.clients.consumer OffsetAndMetadata]
            [org.apache.kafka.clients.producer KafkaProducer RecordMetadata]
            [org.apache.kafka.common IsolationLevel TopicPartition]))
@@ -180,9 +181,9 @@
   "Manufactures a held message: a record on `topic`'s partition whose stamp names a
   position far past the log end of `names` there, so the receiving task reads it and holds
   it. Waits until the task has committed reading past it. Returns {:held bool :held-at o}."
-  [test ^Admin admin {:keys [process topic names partition]}]
+  [test ^Admin admin {:keys [process topic names partition ahead]}]
   (let [ids (client/topic-ids test admin)
-        named (+ 1000000 (client/log-end admin (TopicPartition. names (int partition))))
+        named (+ (or ahead 1000000) (client/log-end admin (TopicPartition. names (int partition))))
         uid (str "held-" topic "-" partition)
         tp (TopicPartition. topic (int partition))
         ;; A partition can stall a send for a while; the record must get through.
@@ -345,6 +346,120 @@
           (:held held) (assoc :expect {:process process :refusal :CHANNEL_REMOVED_WITH_HELD_MESSAGES})))
       (finally (start-all! test)))))
 
+(defn- retention-hold!
+  "Retention discards a held message's copy, on retention's own clock: the topic's
+  retention is shortened to a minute with half-minute segments, a record is held on it
+  with a stamp naming a position two hundred past the named channel's end, and the fault waits
+  until the broker's log start has moved past the held record. The hold settles when the
+  named channel grows past the stamp, and the delivery must then come from the ordering
+  changelog, the only copy left. Retention that overtakes a lagging task on the topic is
+  Safety 8's condition, so POSITIONS_DISCARDED_UNREAD is justified, not expected."
+  [test {:keys [process topic names partition] :as v}]
+  (with-admin test
+    (fn [^Admin admin]
+      (let [id (get (client/topic-ids test admin) topic)
+            resource (ConfigResource. ConfigResource$Type/TOPIC topic)]
+        (get! (.all (.incrementalAlterConfigs admin {resource [(AlterConfigOp. (ConfigEntry. "retention.ms" "60000") AlterConfigOp$OpType/SET)
+                                                               (AlterConfigOp. (ConfigEntry. "segment.ms" "30000") AlterConfigOp$OpType/SET)]})))
+        (let [held (hold! test admin (assoc v :ahead 200))
+              tp (TopicPartition. topic (int partition))
+              discarded (try (with-views test
+                               (fn [views]
+                                 (util/await-fn
+                                  (fn [] (let [start (log-start views tp)]
+                                           (when-not (and start (> start (:held-at held)))
+                                             (throw (ex-info "the held record's copy is still retained" {:log-start start})))
+                                           start))
+                                  {:retry-interval 5000 :log-interval 30000 :timeout 600000
+                                   :log-message (str "Waiting for retention to discard " tp "@" (:held-at held))})))
+                             (catch Exception e (warn "Retention did not discard the held copy:" (.getMessage e)) nil))]
+          (cond-> (assoc held :channel [id partition] :retention-ms 60000 :discarded-at discarded)
+            (and (:held held) discarded)
+            (assoc :expect-delivered {:process process :channel [id partition] :offset (:held-at held)})))))))
+
+(defn- await-refusal!
+  "Waits until some instance reports the process refused; nil when none does in time."
+  [test process]
+  (try (util/await-fn
+        (fn [] (or (first (for [node (:nodes test)
+                                :let [s (try (get-in (client/status node) [:processes process]) (catch Exception _ nil))]
+                                :when (:refusal s)]
+                            (:refusal s)))
+                   (throw (ex-info "not refused yet" {:process process}))))
+        {:retry-interval 2000 :log-interval 20000 :timeout 240000
+         :log-message (str "Waiting for " process " to refuse")})
+       (catch Exception _ nil)))
+
+(defn- reset-process!
+  "The runbook's reset after a refusal: every instance stopped, the group deleted, the
+  ordering changelog deleted, every instance's local state wiped, and a start as the
+  process's next lifetime from the initial position the reset chose; a received topic the
+  run had deleted is created again first, as the runbook says. The lifetime's start
+  positions are what the bootstrap committed, read back before the first step moves them,
+  so the checker judges the new lifetime from where it began; a topic the run has dropped
+  from the declaration is not received and not waited for. From then on the run's
+  observations are keyed by the ids this lifetime attached to. Nothing is done unless the
+  refusal came."
+  [test {:keys [process initial] :as v}]
+  (let [initial (keyword (or initial :earliest))
+        group (client/group-id process)
+        changelog (str group "-__parsley.ordering-changelog")
+        received (remove @(:dropped-topics test) (get client/processes process))]
+    (if-let [refusal (await-refusal! test process)]
+      (do
+        (stop-all! test)
+        (try
+          (with-admin test
+            (fn [^Admin admin]
+              (await-group-empty! admin group)
+              (util/await-fn
+               (fn [] (try (get! (.all (.deleteConsumerGroups admin [group])))
+                           (catch ExecutionException e
+                             (when-not (instance? org.apache.kafka.common.errors.GroupIdNotFoundException (.getCause e))
+                               (throw e)))))
+               {:retry-interval 2000 :log-interval 10000 :timeout 120000 :log-message (str "Deleting group " group)})
+              (delete-topic! admin changelog)))
+          (c/on-nodes test (fn [t n] (db/wipe-harness-state! t n)))
+          (let [recreated (vec (for [topic received :when (contains? @(:gone-topics test) topic)]
+                                 (do (db/create-topics! test [topic])
+                                     (swap! (:gone-topics test) disj topic)
+                                     topic)))
+                ends (with-admin test (fn [^Admin admin] (trace-high-watermarks test admin)))
+                incarnation (inc (get @(:incarnations test) process 1))]
+            (swap! (:incarnations test) assoc process incarnation)
+            (swap! (:initial-positions test) assoc process initial)
+            (start-all! test)
+            (with-admin test
+              (fn [^Admin admin]
+                (let [ids (client/describe-ids admin client/topics)
+                      partitions (for [topic received :when (contains? ids topic) p (range (:partitions test))]
+                                   (TopicPartition. topic (int p)))
+                      ;; The lifetime runs whether or not its bootstrap is seen to commit in
+                      ;; time; what it committed is reported, and the lifetime with it.
+                      [committed error] (try [(util/await-fn
+                                               (fn [] (let [c (client/committed admin group)]
+                                                        (when-not (every? #(contains? c %) partitions)
+                                                          (throw (ex-info "the bootstrap has not committed every start position" {})))
+                                                        c))
+                                               {:retry-interval 500 :log-interval 10000 :timeout 180000
+                                                :log-message (str "Waiting for " group "'s bootstrap to commit its start positions")})
+                                              nil]
+                                             (catch Exception e
+                                               (warn "The bootstrap of" group "was not seen to commit every start position:" (.getMessage e))
+                                               [(client/committed admin group) (str "bootstrap not seen to commit: " (.getMessage e))]))]
+                  (reset! (:read-ids test) ids)
+                  (cond-> {:refusal refusal :incarnation incarnation :initial initial :trace-ends ends
+                           :recreated recreated :topic-ids ids
+                           :start-positions (into {} (for [^TopicPartition tp partitions
+                                                           :when (contains? committed tp)]
+                                                       [[(get ids (.topic tp)) (.partition tp)] (get committed tp)]))
+                           :expect-running (str process "#" incarnation)}
+                    error (assoc :error error))))))
+          (catch Exception e
+            (start-all! test)
+            (throw e))))
+      {:refused false})))
+
 (def justifies
   "The refusal reasons each fault justifies once injected."
   {:truncate-records #{:POSITIONS_DISCARDED_UNREAD}
@@ -352,7 +467,8 @@
    :recreate-topic #{:CHANNEL_IDENTITY_CHANGED :CHANNEL_DELETED_WITH_UNDELIVERED_MESSAGES}
    :delete-changelog #{:ORDERING_STATE_LOST}
    :add-partitions #{:TASK_WIDTH_CHANGED}
-   :restart-dropping #{:CHANNEL_REMOVED_WITH_HELD_MESSAGES}})
+   :restart-dropping #{:CHANNEL_REMOVED_WITH_HELD_MESSAGES}
+   :retention-hold #{:POSITIONS_DISCARDED_UNREAD}})
 
 (defn parsley-nemesis
   "The Parsley-specific faults. Each :f names a fault; :value carries its target and,
@@ -362,7 +478,7 @@
     nemesis/Reflection
     (fs [_] #{:kill-instance :restart-instance :pause-instance :resume-instance :wipe-restart-instance
               :restart-dropping :truncate-records :discard-held-copy :delete-topic :recreate-topic
-              :reset-offsets :delete-changelog :add-partitions})
+              :reset-offsets :delete-changelog :add-partitions :retention-hold :reset-process})
 
     nemesis/Nemesis
     (setup! [this test] this)
@@ -400,7 +516,9 @@
                        :reset-offsets (reset-offsets! test v)
                        :delete-changelog (delete-changelog! test v)
                        :add-partitions (add-partitions! test v)
-                       :restart-dropping (restart-dropping! test v))
+                       :restart-dropping (restart-dropping! test v)
+                       :retention-hold (retention-hold! test v)
+                       :reset-process (reset-process! test v))
                      (catch Exception e
                        (warn e "Fault" f "failed part-way")
                        {:error (str (.getName (class e)) ": " (.getMessage e))}))]
@@ -445,11 +563,28 @@
   "The planned refusal-class faults, one per interval after a first interval of plain
   running. :corrupt is a client's send, which the workload schedules."
   [opts planned]
-  (let [ops (for [[fault target] planned
-                  :when (not= :corrupt fault)]
-              {:type :info :f (get op-f fault fault) :value (assoc target :partition (rand-int (:partitions opts)))})]
+  (let [reset (fn [[fault target]]
+                {:type :info :f :reset-process
+                 :value {:process (:process target) :initial (if (= :corrupt fault) :latest :earliest)}})
+        ops (concat
+             (for [[fault target :as plan] planned
+                   :when (not= :corrupt fault)
+                   op (cons {:type :info :f (get op-f fault fault) :value (assoc target :partition (rand-int (:partitions opts)))}
+                            (when (:reset-after-refusal opts) [(reset plan)]))]
+               op)
+             ;; The malformed send is the workload's, at the first interval; its reset follows the rest.
+             (when (:reset-after-refusal opts)
+               (for [plan planned :when (= :corrupt (first plan))] (reset plan))))]
     (when (seq ops)
       (after (:nemesis-interval opts 60) (gen/delay (:nemesis-interval opts 60) ops)))))
+
+(defn- retention-generator
+  "One retention hold, at the selfer, after the first interval."
+  [opts]
+  (when (:retention-hold (:nemesis opts))
+    (after (:nemesis-interval opts 60)
+           {:type :info :f :retention-hold
+            :value {:process "selfer" :topic "self" :names "d" :partition (rand-int (:partitions opts))}})))
 
 (defn parsley-package
   "A nemesis package in jepsen.nemesis.combined's shape, for the Parsley faults."
@@ -463,7 +598,8 @@
         ;; before an instance has finished starting.
         generators (remove nil? [(after interval (gen/stagger interval instance))
                                  (after interval (gen/stagger interval topic))
-                                 refusal])]
+                                 refusal
+                                 (retention-generator opts)])]
     {:nemesis (parsley-nemesis)
      :generator (when (seq generators) (apply gen/any generators))
      :final-generator [{:type :info :f :resume-instance :value {:nodes :all}}
@@ -472,7 +608,8 @@
              {:name "instance-pause" :start #{:pause-instance} :stop #{:resume-instance} :color "#A0B1E9"}
              {:name "parsley-fault" :fs (-> (set (map #(get op-f % %) refusal-faults))
                                            (disj :corrupt)
-                                           (conj :wipe-restart-instance :discard-held-copy :reset-offsets))
+                                           (conj :wipe-restart-instance :discard-held-copy :reset-offsets
+                                                 :retention-hold :reset-process))
               :color "#C5A0E9"}}}))
 
 (defn package

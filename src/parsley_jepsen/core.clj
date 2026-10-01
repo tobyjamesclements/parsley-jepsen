@@ -27,7 +27,7 @@
 (def all-faults
   #{:partition :kill :pause :clock
     :instance-kill :instance-pause :wipe
-    :discard-held-copy :reset-offsets
+    :discard-held-copy :reset-offsets :retention-hold
     :truncate :delete-topic :recreate-topic :delete-changelog :add-partitions :restart-dropping :corrupt})
 
 (defn- parse-faults [s]
@@ -48,6 +48,7 @@
    [nil "--nemesis-interval SECONDS" "Seconds between nemesis operations; rebalances and transaction timeouts run to tens of seconds."
     :default 60 :parse-fn parse-long]
    [nil "--[no-]out-of-contract" "Send occasional stamps naming a log-end offset." :default true]
+   [nil "--reset-after-refusal" "After each refusal-class fault, perform the runbook's reset and run the process on as its next lifetime." :default false]
    [nil "--calibrate KIND" "inversion: an external producer stamps less than it knows, which the checker must flag."
     :parse-fn keyword :validate [#{:inversion} "must be inversion"]]
    [nil "--quiesce-seconds SECONDS" "How long the final phase waits for zero lag." :default 600 :parse-fn parse-long]
@@ -112,6 +113,29 @@
                          ;; reason is the detail of each.
                          :detail (or (:detail s) (:start-failure (:value op)))
                          :trace-ends (nearest-ends reads (:index op))}))
+        ;; An operator's reset starts a process's next lifetime, labelled name#n by the harness
+        ;; in its trace and effects: everything observed of the process after the reset belongs
+        ;; to that lifetime, which has its own tasks, start positions and liveness. While the
+        ;; reset is under way the process is the operator's, not either lifetime's: the group
+        ;; is deleted and bootstrapped again, so what is observed of it then is set aside.
+        resets (vec (for [[invocation completion] (nemesis-faults history)
+                          :let [v (:value completion)]
+                          :when (and (= :reset-process (:f completion)) (map? v) (:incarnation v))]
+                      {:from (:index invocation) :index (:index completion) :process (:process v)
+                       :label (str (:process v) "#" (:incarnation v))
+                       :start-positions (:start-positions v)}))
+        under-reset? (fn [process index]
+                       (some #(and (= process (:process %)) (< (:from %) index (:index %))) resets))
+        lifetime (fn [process index]
+                   (or (:label (last (filter #(and (= process (:process %)) (< (:index %) index)) resets))) process))
+        reads (vec (for [r reads :when (not (under-reset? (:process r) (:index r)))]
+                     (assoc r :process (lifetime (:process r) (:index r)))))
+        statuses (vec (for [s statuses :when (not (under-reset? (:process s) (:index s)))]
+                        (assoc s :process (lifetime (:process s) (:index s)))))
+        lifetime-tasks (vec (for [{:keys [label start-positions]} resets
+                                  [p channels] (group-by second (keys start-positions))]
+                              {:process label :task p :receives (vec (sort channels))
+                               :positions (into {} (for [ch channels] [ch (get start-positions ch)]))}))
         injected (loop [pairs (nemesis-faults history) dropped #{} faults []]
                    (if-let [[invocation completion] (first pairs)]
                      (let [v (:value completion)
@@ -155,15 +179,18 @@
                            :details (assoc (:out-of-contract (:value op)) :uid (:uid (:value op)))})
         stamped-from (into {} (for [op history :when (and (invoke? op) (= :send (:f op)) (:stamped-from (:value op)))]
                                 [(:uid (:value op)) (:stamped-from (:value op))]))
-        tasks (vec (mapcat #(task-receives ids partitions % #{}) (keys client/processes)))
-        starts (vec (for [{:keys [process task receives]} tasks]
-                      {:process process :task task :positions (into {} (map (fn [ch] [ch 0]) receives))}))
+        tasks (vec (concat (mapcat #(task-receives ids partitions % #{}) (keys client/processes))
+                           (map #(dissoc % :positions) lifetime-tasks)))
+        starts (vec (concat (for [{:keys [process task receives]} tasks :when (not (str/includes? process "#"))]
+                              {:process process :task task :positions (into {} (map (fn [ch] [ch 0]) receives))})
+                            (map #(dissoc % :receives) lifetime-tasks)))
         faults (vec (sort-by :index (concat injected corrupt out-of-contract)))
         ;; An observation answered from a stale cache is set aside before either checker
         ;; sees it, so both judge the same observations.
         {fresh :fresh stale :stale} (pchecker/stale-reads :cluster (map #(assoc % :task-name (pchecker/task-name (:process %) (:task %))) reads) faults)]
     (-> dump
         (update :topics #(vec (concat % dead)))
+        (update :processes #(into % (for [{:keys [process label]} resets] [label (get % process)])))
         (update :records (fn [records] (mapv (fn [r] (if-let [from (get stamped-from (:uid r))] (assoc r :stamped-from from) r)) records)))
         (assoc :reads (mapv #(dissoc % :task-name) fresh)
                :stale-reads (mapv #(dissoc % :task-name) stale)
@@ -173,17 +200,35 @@
                :start-positions starts))))
 
 (defn missing-refusals
-  "Every fault that must produce a refusal and did not: no status after it shows its
-  process refused for its reason. A finding, since the README's table says the fault ends
-  in that refusal."
+  "Every fault whose expected outcome did not come: a refusal no later status shows
+  (:expect), a delivery no trace entry made (:expect-delivered, a held record whose copy
+  retention discarded), or a lifetime no later status shows running (:expect-running,
+  after the runbook's reset). Findings, since the README's table says what each fault ends
+  in."
   [export]
-  (vec (for [fault (:faults export)
-             :let [{:keys [process refusal]} (get-in fault [:details :expect])]
-             :when process
-             :when (not-any? (fn [s] (and (= process (:process s)) (= refusal (:refusal s)) (> (:index s) (:index fault))))
-                             (:statuses export))]
-         (str "Expected refusal missing: " (name (:kind fault)) " at index " (:index fault) " should stop "
-              process " with " (name refusal) ", and no later status shows it"))))
+  (vec (concat
+        (for [fault (:faults export)
+              :let [{:keys [process refusal]} (get-in fault [:details :expect])]
+              :when process
+              :when (not-any? (fn [s] (and (= process (:process s)) (= refusal (:refusal s)) (> (:index s) (:index fault))))
+                              (:statuses export))]
+          (str "Expected refusal missing: " (name (:kind fault)) " at index " (:index fault) " should stop "
+               process " with " (name refusal) ", and no later status shows it"))
+        (for [fault (:faults export)
+              :let [{:keys [process channel offset]} (get-in fault [:details :expect-delivered])]
+              :when process
+              :when (not-any? (fn [e] (and (str/starts-with? (:process e) process) (= channel (:channel e)) (= offset (:offset e))))
+                              (:trace export))]
+          (str "Expected delivery missing: " (name (:kind fault)) " at index " (:index fault) " left " process
+               " holding " (first channel) "-" (second channel) "@" offset
+               ", whose copy retention discarded, and no trace entry delivers it from the changelog"))
+        (for [fault (:faults export)
+              :let [label (get-in fault [:details :expect-running])]
+              :when label
+              :when (not-any? (fn [s] (and (= label (:process s)) (= :RUNNING (:lifecycle s)) (> (:index s) (:index fault))))
+                              (:statuses export))]
+          (str "Expected lifetime missing: the reset at index " (:index fault) " should have " label
+               " running, and no later status shows it")))))
 
 (defn- java-oracle
   "Parsley's own Oracle replay over the same export, through the harness jar. :clean? is
@@ -254,9 +299,12 @@
             :db db
             :acked (atom [])
             :topic-ids (atom nil)
+            :read-ids (atom nil)
             :gone-topics (atom #{})
             :dropped-topics (atom #{})
-            :nonserializable-keys [:acked :topic-ids :gone-topics :dropped-topics]
+            :incarnations (atom {})
+            :initial-positions (atom {})
+            :nonserializable-keys [:acked :topic-ids :read-ids :gone-topics :dropped-topics :incarnations :initial-positions]
             :plan planned
             :client (client/client opts)
             :nemesis (:nemesis nemesis)

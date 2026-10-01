@@ -150,10 +150,17 @@ docker nodes, one fault per run at `--rate 2` unless said otherwise):
   is killed, external producers keep sending to `src`, the records just past the splitter's
   committed position on one partition are deleted, and the instances restart.
   `POSITIONS_DISCARDED_UNREAD` came, and the rest of the run judges valid.
-- **Retention discards a held message's copy** (`discard-held-copy`): records up to a task's
-  committed position are deleted while it runs. No refusal, and the run judges valid; what
-  the discarded records named is gone with them, so a task that received them has no
-  expression bound and the two checks that need one are not made for its sends.
+- **Retention discards a held message's copy** (`discard-held-copy`, and `retention-hold`
+  on retention's own clock): records up to a task's committed position are deleted while
+  it runs. No refusal, and the run judges valid; what the discarded records named is gone
+  with them, so a task that received them has no expression bound and the two checks that
+  need one are not made for its sends. `retention-hold` makes the table's row happen as
+  written: `self`'s retention is set to a minute with half-minute segments, a record is held
+  there with a stamp naming a position two hundred past `d`'s end, and the fault waits
+  until the broker's log start has passed the held record (`self-0@221`, log start 324,
+  ninety seconds later). The hold settled when `d` grew past the stamp, and the trace shows
+  221 delivered in order from the only copy left, the ordering changelog's; the run judges
+  valid in both checkers over 15,469 entries.
 - **Delete a received topic while messages are held from it** (`delete-topic`): a record on
   `self` stamped with a position far past `d`'s log end is sent, the selfer is seen to read
   it, `self` is deleted while the selfer runs, and every instance is restarted. On the live
@@ -231,6 +238,41 @@ docker nodes, one fault per run at `--rate 2` unless said otherwise):
   committed data rather than reading as Parsley's. A task's expressed frontier only grows
   along its trace, except on a channel that no longer exists (Structural 13), and that rule
   now runs in every run.
+- **Compound**: `--nemesis partition,kill,pause,instance-kill,instance-pause --nemesis-interval 15
+  --time-limit 900 --rate 5`: a fault every fifteen seconds, so partitions, broker kills
+  and pauses and instance kills and pauses overlap rather than letting the cluster recover
+  between them. 184 faults in a quarter of an hour; 14,212 trace entries over 14,212
+  records, twelve observations set aside as stale, no refusal, valid in both checkers.
+  (With nothing refused and nothing discarded, every committed record is received by
+  exactly one process and traced once, so the two counts are equal; retention and
+  refusals are what separate them.)
+- **High rate**: `--rate 20 --nemesis instance-kill,instance-pause --time-limit 600`: 133,171
+  entries and records, 1,063 out-of-contract stamps, 6,552 observations, valid in both
+  checkers; the analysis took seven and a half minutes against eight seconds for the
+  compound run, which is where the checkers stand at a hundred thousand entries.
+- **Reset after refusal** (`--reset-after-refusal`): after each refusal-class fault the
+  nemesis performs the runbook's reset once the refusal is seen — every instance stopped,
+  the group and its ordering changelog deleted, local state wiped, a received topic the
+  run had deleted created again — and starts the process as its next lifetime, labelled
+  `name#2` by the harness in its trace and forwarded uids (`--incarnation name=2`), from
+  the earliest position, or the latest after an undecodable header
+  (`--initial-position name=latest`). The lifetime's start positions are what the
+  bootstrap committed, read back before its first step; the checkers judge it as a process
+  of its own, from there, under its own tasks and liveness, and expect a later status to
+  show it running. Two runs, both valid in both checkers once the adapter was right:
+  `delete-topic,corrupt` (the selfer's reset recreated `self` and started from the
+  earliest position; the splitter's started from the latest, past the malformed record,
+  13,736 entries), and `truncate,delete-changelog,recreate-topic,restart-dropping`
+  (38,437 entries, all four refusals and all four lifetimes). Three things the first
+  attempts taught: a lifetime that attached to a recreated topic commits positions the
+  observation must key by the new id, where the run's start ids served until then (the
+  reset sets them); a reset of a process whose declaration dropped a topic does not wait
+  for a position on it; and what is observed of a process while its reset is under way (a
+  deleted group, a bootstrap under the old name) belongs to neither lifetime and is set
+  aside. The checkers' Assumption 2 rule also had to learn that a lifetime an operator's
+  reset attached to the new incarnation is the runbook's recovery, not a task that went
+  on after its topic was recreated: it now falls on the tasks that received the dead
+  incarnation.
 
 ## The checker
 
@@ -360,6 +402,9 @@ node alongside the broker. On Parsley's side the pieces are `JepsenTopology`,
       start rather than leaving it to the host. Not verified: clock skew as skew rather
       than a cluster-wide jump.
 - [x] Long mixed runs on both broker versions. A separate, labelled unclean-election run.
+- [x] Beyond the hour: retention on its own clock across a hold, faults every fifteen
+  seconds, the runbook's reset after each refusal with the next lifetime judged, and
+  twenty sends a second.
       An hour on each version under the non-refusal faults (valid on 4.3.1; one
       nemesis-made refusal on 3.7.0, explained under [Nemeses](#nemeses)), ten minutes with
       every fault on 4.3.1, and the unclean-election run, which the checkers attribute to
@@ -407,10 +452,11 @@ lein run test --nodes-file ~/nodes --kafka-version 4.3.1 --time-limit 3600 \
 ```
 
 `--nemesis` takes `none` or any of `partition`, `kill`, `pause`, `clock` (Jepsen's, over the
-brokers), `instance-kill`, `instance-pause`, `wipe`, `discard-held-copy`, `reset-offsets`,
-and the refusal-class faults `truncate`, `delete-topic`, `recreate-topic`, `delete-changelog`,
-`add-partitions`, `restart-dropping`, `corrupt`, of which a run schedules at most one per
-process. Every run writes `dump.edn` (the harness export) and `export.edn` (what the checker
+brokers), `instance-kill`, `instance-pause`, `wipe`, `discard-held-copy`, `retention-hold`,
+`reset-offsets`, and the refusal-class faults `truncate`, `delete-topic`, `recreate-topic`,
+`delete-changelog`, `add-partitions`, `restart-dropping`, `corrupt`, of which a run
+schedules at most one per process; with `--reset-after-refusal` each is followed by the
+runbook's reset and the process runs on as its next lifetime. Every run writes `dump.edn` (the harness export) and `export.edn` (what the checker
 judged) beside its history under `store/`, and the `:parsley` result carries the Clojure
 checker's violations, Parsley's Oracle verdict over the same file, and any expected refusal
 that never came. The control node on an arm64 machine needs the control image's JDK URL

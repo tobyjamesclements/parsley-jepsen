@@ -40,6 +40,32 @@
   (let [{:keys [violations]} (checker/check-file (str exports-dir "/DELIVER_PAST_DEAD_HOLDS-scenario.edn"))]
     (is (some #(str/starts-with? % "Safety 1") violations) (str/join "\n" violations))))
 
+(deftest a-recreation-falls-on-the-tasks-attached-to-the-dead-incarnation
+  (let [old "11111111-1111-1111-1111-111111111111"
+        new "22222222-2222-2222-2222-222222222222"
+        record (fn [id offset] {:topic id :partition 0 :offset offset :key (str "k" offset) :value "v" :uid (str id "@" offset) :causes nil})
+        entry (fn [process to id offset] {:process process :task 0 :tp "n1" :to to :channel [id 0] :offset offset
+                                          :uid (str id "@" offset) :causes nil :effects []})
+        export {:format 1 :source :cluster
+                :processes {"cycler" {:receives ["c"] :sends []} "cycler#2" {:receives ["c"] :sends []}}
+                :topics [{:id old :name "c" :partitions 1 :alive false :log-start {0 0} :log-end {0 2}}
+                         {:id new :name "c" :partitions 1 :alive true :log-start {0 0} :log-end {0 1}}]
+                :tasks [{:process "cycler" :task 0 :receives [[old 0]]}
+                        {:process "cycler#2" :task 0 :receives [[new 0]]}]
+                :start-positions [{:process "cycler" :task 0 :positions {[old 0] 0}}
+                                  {:process "cycler#2" :task 0 :positions {[new 0] 0}}]
+                :records [(record old 0) (record old 1) (record new 0)]
+                :trace [(entry "cycler" 0 old 0) (entry "cycler" 2 old 1) (entry "cycler#2" 3 new 0)]
+                :reads [] :stale-reads [] :statuses []
+                :faults [{:index 5 :kind :recreate :justifies [:CHANNEL_IDENTITY_CHANGED] :trace-ends {"n1" 1}
+                          :details {:process "cycler" :topic "c" :old old :new new :reinitialised-ends {"n1" 1}}}]}
+        assumption-2 (filter #(str/starts-with? % "Assumption 2") (:violations (checker/check export)))]
+    (testing "the task that received the dead incarnation and went on delivering is flagged"
+      (is (= 1 (count assumption-2)))
+      (is (str/starts-with? (first assumption-2) "Assumption 2: cycler-0 delivered")))
+    (testing "the lifetime an operator's reset attached to the new incarnation is not"
+      (is (not-any? #(str/includes? % "cycler#2") assumption-2)))))
+
 (deftest a-cluster-run-passes
   (let [file (io/file exports-dir "cluster-honest.edn")]
     (when (.exists file)

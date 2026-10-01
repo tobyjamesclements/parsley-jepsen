@@ -22,7 +22,9 @@
   {:uid u :topic t :topic-id id :partition p :offset o :causes {...}}, which the workload
   stamps from. :topic-ids holds each topic's id as it was when the run began: a task's
   committed positions are attributed to the incarnation it attached to, and no process in
-  this test ever attaches to a recreated one (it refuses, or is redeclared without it)."
+  this test attaches to a recreated one (it refuses, or is redeclared without it) until an
+  operator's reset starts its next lifetime, after which :read-ids holds the ids that
+  lifetime attached to and observations are keyed by those."
   (:require [clojure.edn :as edn]
             [clojure.java.shell :as sh]
             [clojure.string :as str]
@@ -149,6 +151,13 @@
     (or @ids
         (locking ids
           (or @ids (reset! ids (describe-ids admin topics)))))))
+
+(defn read-ids
+  "The ids a group's committed positions are keyed by: those of the run's start, until an
+  operator's reset bootstraps a process's next lifetime on a recreated topic (nemesis
+  reset-process!), which sets the ids that lifetime attached to."
+  [test ^Admin admin]
+  (or (some-> (:read-ids test) deref) (topic-ids test admin)))
 
 (defn list-offsets
   "The latest or earliest offset of each partition under `isolation`."
@@ -337,7 +346,7 @@
       (try
         (case (:f op)
           :status (assoc op :type :ok :value (assoc (status (:value op)) :node (:value op)))
-          :reads (assoc op :type :ok :value (observe-reads views test (topic-ids test admin)))
+          :reads (assoc op :type :ok :value (observe-reads views test (read-ids test admin)))
           :quiesce (quiesce test admin op)
           :dump (assoc op :type :ok :value (dump test admin)))
         (catch Exception e

@@ -205,7 +205,12 @@
            "--state-dir" harness-state
            "--status-port" status-port
            "--log-file" harness-log]
-          (mapcat (fn [topic] ["--drop-topic" topic]) drop-topics)))
+          (mapcat (fn [topic] ["--drop-topic" topic]) drop-topics)
+          ;; A process an operator has reset runs as its next lifetime, labelled so, from
+          ;; the initial position the reset chose.
+          (mapcat (fn [[process n]] ["--incarnation" (str process "=" n)]) (some-> (:incarnations test) deref sort))
+          (mapcat (fn [[process initial]] ["--initial-position" (str process "=" (name initial))])
+                  (some-> (:initial-positions test) deref sort))))
 
 (defn start-harness!
   "Starts the instance on this node, declaring everything but the topics the run has
