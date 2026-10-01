@@ -50,6 +50,7 @@ Every property is judged from ground truth reconstructed outside the engine, as 
 | Liveness 1 | At quiescence, every committed record on a received partition at or above the process's start position was delivered, with the spec's exemptions: a process that refused for a ledgered reason, and records held behind an undecodable header or an out-of-contract stamp |
 | Host obligations 3, 5, 6 | Each delivery the topology says produces a send yields exactly one committed downstream record, under crashes mid-step and fenced zombies |
 | Operational 1, 6 | Every refusal in the status history follows an injected fault of the matching kind; network partitions, broker kills, pauses and clock skew justify none |
+| Host obligation 5 | A task's expressed frontier never falls along its own trace, except on a channel that no longer exists: a step expressing less than an earlier committed step did resumed from a state older than the one committed, which only the host losing committed data produces |
 
 ## The system under test
 
@@ -209,7 +210,25 @@ docker nodes, one fault per run at `--rate 2` unless said otherwise):
 - **Long**: `--kafka-version 3.7.0 --nemesis partition,kill,pause,instance-kill,instance-pause,discard-held-copy,reset-offsets
   --time-limit 1200 --rate 5`: 56,352 trace entries and 47,554 records under 69 faults,
   424 of 9,680 observations set aside as stale, judged valid by both checkers in 87
-  seconds, quiesced.
+  seconds, quiesced. Then an hour each on 3.7.0 and 4.3.1 with the same faults at
+  `--rate 3`: 38,533 and 48,905 entries, 21 and 29 offset resets, a thousand stale
+  observations set aside in each. The 4.3.1 hour judged valid. The 3.7.0 hour had one
+  violation, from the nemesis rather than Parsley: a `reset-offsets` whose request timed
+  out inside a partition was applied by the broker later, after a `discard-held-copy` had
+  read the still-unreset position and deleted the records before it, so the late reset put
+  the splitter below the log start and it refused `POSITIONS_DISCARDED_UNREAD` with no fault
+  admitting to it. The nemesis now reads a group's position as the lowest of every broker's
+  view and confirms an alter before the next fault.
+- **Unclean leader election** (`--unclean-leader-election --nemesis kill,pause,partition`,
+  ten minutes, 4.3.1, stored under `parsley-4.3.1-unclean`): invalid, as it should be, and
+  attributed. The joiner's expressed frontier fell along its own trace (309 back to 232 on
+  one channel) after an unclean election truncated its ordering changelog, its group's
+  offsets and the trace behind what it had committed; both checkers report that as **Host
+  obligation 5** (resumed from a state older than the one committed, which the host lost),
+  beside the Structural 15 and Liveness consequences, so the verdict names Kafka's loss of
+  committed data rather than reading as Parsley's. A task's expressed frontier only grows
+  along its trace, except on a channel that no longer exists (Structural 13), and that rule
+  now runs in every run.
 
 ## The checker
 
@@ -337,10 +356,13 @@ node alongside the broker. On Parsley's side the pieces are `JepsenTopology`,
       process, and [Nemeses](#nemeses) says what came of each. Ten of the table's eleven rows
       came out as the table says; topic deletion did not, and the run says so. Not verified:
       clock skew as skew rather than a cluster-wide jump.
-- [ ] Long mixed runs on both broker versions. A separate, labelled unclean-election run.
-      Done so far: ten minutes with every fault on 4.3.1, twenty minutes with the
-      non-refusal faults on 3.7.0 at `--rate 5` (56,352 entries, judged in 87 seconds).
-      Not done: an hour, which is only time now, and the unclean-election run.
+- [x] Long mixed runs on both broker versions. A separate, labelled unclean-election run.
+      An hour on each version under the non-refusal faults (valid on 4.3.1; one
+      nemesis-made refusal on 3.7.0, explained under [Nemeses](#nemeses)), ten minutes with
+      every fault on 4.3.1, and the unclean-election run, which the checkers attribute to
+      the host's loss of committed data. Not done: anything longer than an hour, and the
+      refusal-class faults inside an hour-long run (a refusal is terminal, so they end the
+      flow they stop).
 
 ## Reference code
 

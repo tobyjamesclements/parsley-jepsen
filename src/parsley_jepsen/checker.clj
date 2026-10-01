@@ -15,8 +15,9 @@
   Judgements, cited as in Parsley's SPEC.md: Safety 1 at delivery time and over delivered
   pairs, Safety 2, Safety 3, Safety 7, Safety 8, Structural 12, 14 and 15, over-expression,
   Liveness 1 at quiescence with the spec's exemptions, Host obligations 3 and 6 through the
-  effects each step declared, Assumption 2, and Operational 1 and 6: every refusal follows an
-  injected fault that justifies it.
+  effects each step declared, Host obligation 5 through the frontier each step expressed,
+  which never falls along a task's trace unless the host lost committed state, Assumption 2,
+  and Operational 1 and 6: every refusal follows an injected fault that justifies it.
 
   A causal past is a frontier, the greatest position per channel, standing for every
   position up to it; under FIFO delivery (Safety 3, judged on its own) that is the past
@@ -575,6 +576,7 @@
            delivered []
            engine-past {}
            max-delivered {}
+           expressed {}
            violations []]
       (if (empty? entries)
         {:violations violations :delivered delivered :fed fed :fed-set fed-set
@@ -618,6 +620,19 @@
               upper (expression-bound m task entry delivered)
               past (past-after m entry)
               excused (set (filter #(dead? m %) (keys past)))
+              ;; A task's expressed frontier only grows along its own trace: it is its
+              ;; committed state, and a step that expresses less than an earlier committed step
+              ;; did resumed from a state older than the one committed, which the host lost.
+              ;; A channel that no longer exists is the one exception: its causes no longer
+              ;; matter and may be discarded (Structural 13).
+              v (into v (when (map? (:meta entry))
+                          (for [[channel position] (:meta entry)
+                                :let [before (get expressed channel)]
+                                :when (and before (< position before) (not (dead? m channel)))]
+                            (str "Host obligation 5: " task " expressed " (channel-str channel) "@" position
+                                 " at step " (:tp entry) "@" (:to entry) " after expressing " before
+                                 " at an earlier committed step: it resumed from a state older than the one it had committed, which the host lost"))))
+              expressed (if (map? (:meta entry)) (merge-with max expressed (:meta entry)) expressed)
               v (into v (check-expression m (trace-pos m entry) (:meta entry) past upper excused))
               v (reduce (fn [v [topic uid]]
                           (let [matches (filter #(= (topic-name m (:topic %)) topic) (get-in m [:records-by-uid uid]))]
@@ -637,7 +652,7 @@
                                 (reduce (fn [v r] (into v (check-expression m (:pos r) (:meta r) past upper excused)))
                                         v matches)))))
                         v (:effects entry))]
-          (recur (rest entries) delivered-set delivered engine-past max-delivered (into violations v)))))))
+          (recur (rest entries) delivered-set delivered engine-past max-delivered expressed (into violations v)))))))
 
 ;; ---- final judgements ----
 
