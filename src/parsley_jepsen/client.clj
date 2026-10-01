@@ -25,6 +25,7 @@
   this test ever attaches to a recreated one (it refuses, or is redeclared without it)."
   (:require [clojure.edn :as edn]
             [clojure.java.shell :as sh]
+            [clojure.string :as str]
             [clojure.tools.logging :refer [info warn]]
             [jepsen [client :as client]
                     [store :as store]]
@@ -258,15 +259,24 @@
 
 (defn dump
   "The final dump through the harness jar on the control node: every topic from earliest
-  under read_committed, headers included, and the trace. Written to the store directory."
+  under read_committed, headers included, and the trace. Written to the store directory.
+  Tried a few times, since the brokers the final generator restarted may still be electing
+  leaders."
   [test ^Admin admin]
   (let [ids (topic-ids test admin)
         out (store/path! test "dump.edn")
-        result (sh/sh "java" "-jar" (:harness-jar test) "export"
-                      "--bootstrap" (db/bootstrap-servers test)
-                      "--out" (.getPath out))]
+        result (loop [attempt 1]
+                  (let [result (sh/sh "java" "-jar" (:harness-jar test) "export"
+                                      "--bootstrap" (db/bootstrap-servers test)
+                                      "--out" (.getPath out))]
+                    (if (or (zero? (:exit result)) (>= attempt 6))
+                      result
+                      (do (warn "export failed (attempt" attempt "):" (last (str/split-lines (str (:err result)))))
+                          (Thread/sleep 20000)
+                          (recur (inc attempt))))))]
     (when-not (zero? (:exit result))
-      (throw (ex-info "export failed" result)))
+      (throw (ex-info (str "export failed: " (str/join " | " (take-last 3 (remove str/blank? (str/split-lines (str (:err result)))))))
+                      (dissoc result :out))))
     (let [export (edn/read-string (slurp out))]
       {:file (.getPath out) :topic-ids ids :records (count (:records export)) :trace (count (:trace export))})))
 
@@ -291,22 +301,26 @@
                                :causes (if (or (:malformed v) (:understamp v)) {} (:stamp v {}))})
     (assoc op :type :ok :value v)))
 
+(defn- error [^Throwable e]
+  (str (.getName (class e)) ": " (.getMessage e)))
+
 (defn- quiesce
   "Waits for zero lag on every received partition of every process that has not refused,
   with the trace ends unchanged across three polls two seconds apart."
   [test ^Admin admin op]
   (let [deadline (+ (System/nanoTime) (long (* (:quiesce-seconds test 600) 1e9)))]
     (loop [stable 0 previous nil]
-      (let [lagging (lag admin test (refused-processes test) @(:gone-topics test))
-            ends (trace-ends admin (:partitions test) IsolationLevel/READ_COMMITTED)
-            stable (if (and (empty? lagging) (= ends previous)) (inc stable) 0)]
+      ;; A poll that fails (brokers restarted by the final generator are still electing
+      ;; leaders) is a poll that saw no quiescence, not the end of the wait.
+      (let [[lagging ends error] (try [(lag admin test (refused-processes test) @(:gone-topics test))
+                                       (trace-ends admin (:partitions test) IsolationLevel/READ_COMMITTED)
+                                       nil]
+                                      (catch Exception e [nil nil (error e)]))
+            stable (if (and (nil? error) (empty? lagging) (= ends previous)) (inc stable) 0)]
         (cond
           (>= stable 3) (assoc op :type :ok :value {:lag lagging :trace-ends ends})
-          (> (System/nanoTime) deadline) (assoc op :type :fail :value {:lag lagging :trace-ends ends})
+          (> (System/nanoTime) deadline) (assoc op :type :fail :value {:lag lagging :trace-ends ends :error error})
           :else (do (Thread/sleep 2000) (recur stable ends)))))))
-
-(defn- error [^Throwable e]
-  (str (.getName (class e)) ": " (.getMessage e)))
 
 (defrecord Client [producer admin views]
   client/Client

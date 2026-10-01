@@ -191,7 +191,10 @@ docker nodes, one fault per run at `--rate 2` unless said otherwise):
   lasting about an interval, past the transaction timeout) produced no refusal and judge
   valid; a partition cut a group coordinator off and it kept answering from its stale
   cache, which is why every observation is now the freshest of every broker's view. Broker
-  kill and pause (`kill`, `pause`) are wired but were not run. `clock` runs (bumps, strobes,
+  kill and pause (`kill`, `pause`, Kafka 3.7.0, five minutes) produced no refusal and judge
+  valid, once the harness retried a start that a broker's death had made fail (a
+  prerequisite failure, which `docs/runbooks.md` says to retry) and its heap was 768 MB,
+  since a broker outage fills every producer's buffer. `clock` runs (bumps, strobes,
   a reset) and judges valid, but on docker nodes the clock is the VM's, shared by every node
   and the control node, so it is a jump for the whole cluster rather than skew between
   nodes, and the VM's clock wants an `ntpdate` afterwards.
@@ -203,6 +206,10 @@ docker nodes, one fault per run at `--rate 2` unless said otherwise):
   refusals the table expects: splitter `POSITIONS_DISCARDED_UNREAD`, joiner
   `ORDERING_STATE_LOST`, cycler `CHANNEL_IDENTITY_CHANGED`, selfer
   `CHANNEL_REMOVED_WITH_HELD_MESSAGES`.
+- **Long**: `--kafka-version 3.7.0 --nemesis partition,kill,pause,instance-kill,instance-pause,discard-held-copy,reset-offsets
+  --time-limit 1200 --rate 5`: 56,352 trace entries and 47,554 records under 69 faults,
+  424 of 9,680 observations set aside as stale, judged valid by both checkers in 87
+  seconds, quiesced.
 
 ## The checker
 
@@ -321,19 +328,19 @@ node alongside the broker. On Parsley's side the pieces are `JepsenTopology`,
       512 MB heaps). Verified: Kafka 4.3.1, `--time-limit 120 --nemesis none` ends with the
       `:parsley` checker `:valid? true` over 7318 trace entries and as many records, quiesced,
       and Parsley's own Oracle replay clean over the same export; `--calibrate inversion` is
-      flagged by both. Not verified: Kafka 3.7.0, more than three nodes, and runs longer than
-      two minutes.
+      flagged by both. Kafka 3.7.0, the floor the spec names, runs the same (clean over
+      7767 entries, and the broker and long runs below). Not verified: more than three
+      nodes.
 - [x] Nemeses in order of expected yield: instance pause and kill, partitions during commit,
       retention and record deletion, topic delete and recreate, offset reset, changelog
       deletion, clock skew. Each ran on its own for three to five minutes, at most once per
       process, and [Nemeses](#nemeses) says what came of each. Ten of the table's eleven rows
       came out as the table says; topic deletion did not, and the run says so. Not verified:
-      broker kill and pause, clock skew as skew rather than a cluster-wide jump, Kafka 3.7.0,
-      and combinations beyond the ten-minute mixed run.
+      clock skew as skew rather than a cluster-wide jump.
 - [ ] Long mixed runs on both broker versions. A separate, labelled unclean-election run.
-      The checkers no longer stand in the way: with pasts as frontiers both judge a
-      five-minute run in seconds where the set-based replay took five minutes or ran out of
-      heap, so the runs above being short and at `--rate 2` is history, not a limit.
+      Done so far: ten minutes with every fault on 4.3.1, twenty minutes with the
+      non-refusal faults on 3.7.0 at `--rate 5` (56,352 entries, judged in 87 seconds).
+      Not done: an hour, which is only time now, and the unclean-election run.
 
 ## Reference code
 

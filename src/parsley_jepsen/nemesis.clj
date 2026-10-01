@@ -440,4 +440,6 @@
                                       :kill {:targets [:one]}
                                       :pause {:targets [:one]}
                                       :clock {:targets [:one]}})]
-    (nc/compose-packages [combined (parsley-package opts planned)])))
+    ;; Jepsen's own faults wait out the first interval too; stagger would fire one at once.
+    (nc/compose-packages [(update combined :generator #(after (:nemesis-interval opts 60) %))
+                          (parsley-package opts planned)])))
